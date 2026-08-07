@@ -28,7 +28,12 @@ pub const MAX_FUEL: u64 = 5_000_000_000;
 pub const MAX_MEMORY_PAGES: u32 = 512; // 32 MiB
 pub const MAX_OUTPUT: u32 = 65_536;
 
+/// `serde(default)` so a manifest can state only what it grants. The
+/// observation list is the part a reviewer must read; making them restate three
+/// resource limits to say "this falsifier reads nothing" would be noise around
+/// the one line that matters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Manifest {
     /// Observation keys the falsifier may request, e.g.
     /// `ci:status/block/buzz@deadbeef`. Anything else is refused at the host
@@ -165,6 +170,17 @@ mod tests {
         assert!(m.permits("ci:status"));
         assert!(!m.permits("ci:statu"));
         assert!(!m.permits("secrets:aws"));
+    }
+
+    #[test]
+    fn a_partial_manifest_takes_the_default_limits() {
+        let m: Manifest = serde_json::from_str(r#"{"observations":["ci:status"]}"#).unwrap();
+        assert_eq!(m.fuel, Manifest::default().fuel);
+        assert!(!m.is_pure());
+
+        let m: Manifest = serde_json::from_str("{}").unwrap();
+        assert!(m.is_pure(), "granting nothing is the default");
+        assert_eq!(m.digest(), Manifest::pure().digest());
     }
 
     #[test]

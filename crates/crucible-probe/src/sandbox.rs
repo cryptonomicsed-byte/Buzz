@@ -262,7 +262,10 @@ impl Falsifier {
             }
         };
 
-        if !matches!(instance.get_export(&store, "memory"), Some(Extern::Memory(_))) {
+        if !matches!(
+            instance.get_export(&store, "memory"),
+            Some(Extern::Memory(_))
+        ) {
             return ProbeResult::inconclusive("module does not export its memory", 0, Vec::new());
         }
 
@@ -303,7 +306,9 @@ impl Falsifier {
                 failure: None,
             },
             // Ran to completion without saying anything. Silence is not assent.
-            None => ProbeResult::inconclusive("returned without emitting a verdict", used, observed),
+            None => {
+                ProbeResult::inconclusive("returned without emitting a verdict", used, observed)
+            }
         }
     }
 
@@ -327,11 +332,15 @@ impl Falsifier {
         linker.func_wrap(
             HOST_MODULE,
             "observe_len",
-            |mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> Result<i32, wasmi::Error> {
+            |mut caller: Caller<'_, HostState>,
+             key_ptr: i32,
+             key_len: i32|
+             -> Result<i32, wasmi::Error> {
                 let mem = memory_of(&caller)?;
                 let key = read_guest(&mem, &caller, key_ptr, key_len)
                     .ok_or_else(|| trap("observe_len key out of bounds"))?;
-                let key = String::from_utf8(key).map_err(|_| trap("observation key is not utf-8"))?;
+                let key =
+                    String::from_utf8(key).map_err(|_| trap("observation key is not utf-8"))?;
 
                 // Refusal is a trap, not a sentinel return. A guest that
                 // mistook "denied" for "empty" would silently probe a world it
@@ -363,7 +372,8 @@ impl Falsifier {
                 let mem = memory_of(&caller)?;
                 let key = read_guest(&mem, &caller, key_ptr, key_len)
                     .ok_or_else(|| trap("observe_read key out of bounds"))?;
-                let key = String::from_utf8(key).map_err(|_| trap("observation key is not utf-8"))?;
+                let key =
+                    String::from_utf8(key).map_err(|_| trap("observation key is not utf-8"))?;
                 if !caller.data().manifest.permits(&key) {
                     return Err(trap(format!(
                         "observation `{key}` is not granted by the manifest"

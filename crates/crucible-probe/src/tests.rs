@@ -157,7 +157,10 @@ fn a_falsifier_cannot_reach_past_its_manifest() {
 fn a_refused_observation_halts_the_run() {
     let r = load(READS_SECRETS, Manifest::pure()).run(b"{}", Observations::new());
     assert_eq!(r.outcome, Outcome::Indeterminate);
-    assert!(r.explanation.is_empty(), "it must not have reached its emit");
+    assert!(
+        r.explanation.is_empty(),
+        "it must not have reached its emit"
+    );
 }
 
 /// Even when the runner has the secret sitting in memory for another probe.

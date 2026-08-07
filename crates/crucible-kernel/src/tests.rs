@@ -298,7 +298,8 @@ fn ignorance_and_controversy_are_different_statuses() {
     assert_eq!(controversy.verdict.status, Status::Contested);
 
     assert!(
-        (controversy.verdict.mass - 0.5).abs() < 0.35 && (ignorance.verdict.mass - 0.5).abs() < 0.35,
+        (controversy.verdict.mass - 0.5).abs() < 0.35
+            && (ignorance.verdict.mass - 0.5).abs() < 0.35,
         "both sit near a half — which is exactly why the status must distinguish them"
     );
 }
@@ -341,7 +342,11 @@ fn divergent_output_does_not_poison_an_observational_claim() {
     ];
 
     let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
-    assert_eq!(r.output_digests.len(), 2, "the divergence is still recorded");
+    assert_eq!(
+        r.output_digests.len(),
+        2,
+        "the divergence is still recorded"
+    );
     assert_eq!(r.verdict.status, Status::Contested, "…but as disagreement");
 }
 
@@ -413,7 +418,9 @@ fn evidence_goes_stale_after_enough_half_lives() {
         .collect();
 
     assert_eq!(
-        resolve_at(&claim, &probes, &Ledger::new(), T0).verdict.status,
+        resolve_at(&claim, &probes, &Ledger::new(), T0)
+            .verdict
+            .status,
         Status::Supported
     );
 
@@ -589,7 +596,10 @@ fn every_contribution_is_fully_traced() {
         );
     }
     assert_eq!(
-        r.contributions.iter().filter(|c| c.role == Role::Assertion).count(),
+        r.contributions
+            .iter()
+            .filter(|c| c.role == Role::Assertion)
+            .count(),
         1
     );
 }
@@ -618,17 +628,12 @@ fn a_stricter_policy_demands_more_witnesses() {
         .collect();
 
     assert_eq!(
-        resolve_at(&claim, &probes, &Ledger::new(), T0).verdict.status,
+        resolve_at(&claim, &probes, &Ledger::new(), T0)
+            .verdict
+            .status,
         Status::Supported
     );
-    let strict = resolve(
-        &claim,
-        &probes,
-        &[],
-        &Ledger::new(),
-        &Policy::strict(),
-        T0,
-    );
+    let strict = resolve(&claim, &probes, &[], &Ledger::new(), &Policy::strict(), T0);
     assert_eq!(strict.verdict.status, Status::Insufficient);
 }
 
@@ -724,7 +729,13 @@ fn a_correct_challenger_gains_and_a_wrong_one_loses() {
     assert_eq!(r.verdict.status, Status::Supported);
     assert_eq!(r.open_challenges, 0, "challenge was not passed to resolve");
 
-    settle(&mut ledger, &claim, &probes, &[challenge.clone()], &r.verdict);
+    settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        std::slice::from_ref(&challenge),
+        &r.verdict,
+    );
     assert!(
         ledger.get(&key(90), "ci").r() < crate::calibration::BOOTSTRAP,
         "a bold, wrong challenge must cost standing"

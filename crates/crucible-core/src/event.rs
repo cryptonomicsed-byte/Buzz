@@ -222,9 +222,9 @@ mod tests {
         let s = String::from_utf8(bytes).unwrap();
 
         let expected = concat!(
-            r#"a\"b\\c\nd\te"#,  // the short escapes NIP-01 mandates
-            r#"\u0001"#,           // everything else control -> \uXXXX
-            "f/g\u{e9}",           // solidus and non-ASCII pass through raw
+            r#"a\"b\\c\nd\te"#, // the short escapes NIP-01 mandates
+            r#"\u0001"#,        // everything else control -> \uXXXX
+            "f/g\u{e9}",        // solidus and non-ASCII pass through raw
         );
         assert!(s.contains(expected), "canonical escaping drifted:\n{s}");
     }

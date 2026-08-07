@@ -154,7 +154,12 @@ impl Attestation {
 
     pub fn to_unsigned_tags(&self) -> Vec<Vec<String>> {
         vec![
-            vec!["e".into(), self.claim.to_hex(), String::new(), "claim".into()],
+            vec![
+                "e".into(),
+                self.claim.to_hex(),
+                String::new(),
+                "claim".into(),
+            ],
             vec!["experiment".into(), hex::encode(self.experiment)],
             vec!["outcome".into(), self.outcome.as_str().into()],
             vec!["digest".into(), hex::encode(self.output_digest)],

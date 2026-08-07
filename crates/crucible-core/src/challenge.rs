@@ -36,7 +36,9 @@ impl Challenge {
             created_at: ev.created_at,
             claim: ev.subject()?,
             stake: ev.parse_tag("stake", "not a fraction in (0,1]", |v| {
-                v.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
             })?,
             counter_falsifier: match ev.tag("counter") {
                 None => None,
@@ -59,7 +61,12 @@ impl Challenge {
 
     pub fn to_unsigned_tags(&self) -> Vec<Vec<String>> {
         let mut tags = vec![
-            vec!["e".into(), self.claim.to_hex(), String::new(), "claim".into()],
+            vec![
+                "e".into(),
+                self.claim.to_hex(),
+                String::new(),
+                "claim".into(),
+            ],
             vec!["stake".into(), format!("{}", self.stake)],
         ];
         if let Some(c) = self.counter_falsifier {

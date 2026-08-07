@@ -77,7 +77,9 @@ fn parse_manifest(v: &Value) -> Result<Manifest> {
 fn module_bytes(v: &Value) -> Result<Vec<u8>> {
     match (v.get("module_path"), v.get("module_hex")) {
         (Some(p), None) => {
-            let p = p.as_str().ok_or_else(|| anyhow!("module_path must be a string"))?;
+            let p = p
+                .as_str()
+                .ok_or_else(|| anyhow!("module_path must be a string"))?;
             let raw = std::fs::read(p).with_context(|| format!("reading falsifier module {p}"))?;
             if p.ends_with(".wat") {
                 wat::parse_bytes(&raw)
@@ -88,7 +90,9 @@ fn module_bytes(v: &Value) -> Result<Vec<u8>> {
             }
         }
         (None, Some(h)) => {
-            let h = h.as_str().ok_or_else(|| anyhow!("module_hex must be a string"))?;
+            let h = h
+                .as_str()
+                .ok_or_else(|| anyhow!("module_hex must be a string"))?;
             hex::decode(h).context("module_hex is not valid hex")
         }
         (Some(_), Some(_)) => bail!("give module_path or module_hex, not both"),
@@ -186,7 +190,10 @@ pub fn probe_run(input: &Value) -> Result<Value> {
     let expected = match input.get("module_digest").and_then(Value::as_str) {
         Some(h) => {
             let raw = hex::decode(h).context("module_digest is not hex")?;
-            Some(<[u8; 32]>::try_from(raw.as_slice()).map_err(|_| anyhow!("module_digest must be 32 bytes"))?)
+            Some(
+                <[u8; 32]>::try_from(raw.as_slice())
+                    .map_err(|_| anyhow!("module_digest must be 32 bytes"))?,
+            )
         }
         None => None,
     };
@@ -287,15 +294,23 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
         valid.push(ev);
     }
 
+    // If a claim went missing because its signature did not check out, say so.
+    // "no claim event in the input" would send an agent looking in the wrong
+    // place for a problem that is right here.
+    let dropped = if rejected.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} event(s) failed verification)", rejected.len())
+    };
     let claim_event = match claim_id {
         Some(want) => valid
             .iter()
             .find(|e| e.id == want && e.kind == kinds::CLAIM)
-            .ok_or_else(|| anyhow!("no valid claim event with id {want}"))?,
+            .ok_or_else(|| anyhow!("no valid claim event with id {want}{dropped}"))?,
         None => valid
             .iter()
             .find(|e| e.kind == kinds::CLAIM)
-            .ok_or_else(|| anyhow!("no claim event in the input"))?,
+            .ok_or_else(|| anyhow!("no valid claim event in the input{dropped}"))?,
     };
     let claim = Claim::from_event(claim_event)?;
 
@@ -398,7 +413,10 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
     // Chronological, so reliability earned on an early claim is available to
     // weigh a later one — the loop that makes the ledger mean anything.
     claim_ids.sort_by_key(|id| {
-        let ev = events.iter().find(|e| e.id == *id).expect("id came from events");
+        let ev = events
+            .iter()
+            .find(|e| e.id == *id)
+            .expect("id came from events");
         (ev.created_at, *id.as_bytes())
     });
 
@@ -518,7 +536,9 @@ pub fn event_sign(input: &Value) -> Result<Value> {
         content,
         sig: Signature::from_bytes(sig.to_bytes()),
     };
-    signed.verify().context("freshly signed event failed to verify")?;
+    signed
+        .verify()
+        .context("freshly signed event failed to verify")?;
     Ok(serde_json::to_value(signed)?)
 }
 
@@ -635,5 +655,285 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
                 .unwrap_or_default();
             bail!("unknown verb `{other}`; known verbs: {}", known.join(", "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CI_GREEN: &str = "../../examples/falsifiers/ci-green.wat";
+    const MANIFEST: &str =
+        r#"{"observations":["ci:status"],"fuel":50000000,"memory_pages":64,"max_output":8192}"#;
+
+    fn manifest() -> Value {
+        serde_json::from_str(MANIFEST).unwrap()
+    }
+
+    fn keys(seed: &str) -> (String, String) {
+        let k = keygen(&json!({ "seed": seed })).unwrap();
+        (
+            k["secret_key"].as_str().unwrap().to_string(),
+            k["pubkey"].as_str().unwrap().to_string(),
+        )
+    }
+
+    fn sign(event: &Value, secret: &str) -> Value {
+        event_sign(&json!({"event": event, "secret_key": secret})).unwrap()
+    }
+
+    /// A signed claim plus the experiment id its probes must match.
+    fn a_claim(at: u64) -> (Value, String, String) {
+        let (sk, pk) = keys("author");
+        let built = claim_build(&json!({
+            "pubkey": pk, "created_at": at,
+            "community": "eng", "domain": "ci",
+            "statement": "main is green", "confidence": 0.85,
+            "half_life": 900, "inputs": {"sha": "deadbeef"},
+            "manifest": manifest(), "module_path": CI_GREEN,
+        }))
+        .unwrap();
+        let signed = sign(&built["event"], &sk);
+        let experiment = built["experiment"].as_str().unwrap().to_string();
+        let module_digest = probe_run(&json!({"manifest": manifest(), "module_path": CI_GREEN}))
+            .unwrap()["module_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (signed, experiment, module_digest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn a_probe(
+        claim: &Value,
+        experiment: &str,
+        digest: &str,
+        seed: &str,
+        status: &str,
+        lineage: &str,
+        at: u64,
+    ) -> Value {
+        let (sk, pk) = keys(seed);
+        let out = probe_run(&json!({
+            "manifest": manifest(), "module_path": CI_GREEN, "module_digest": digest,
+            "inputs": {"sha": "deadbeef"},
+            "observations": {"ci:status": status},
+            "claim": claim["id"], "experiment": experiment,
+            "pubkey": pk, "created_at": at,
+            "lineage": lineage, "env": format!("host-{lineage}"), "blind": true,
+        }))
+        .unwrap();
+        sign(&out["attestation"], &sk)
+    }
+
+    #[test]
+    fn the_catalogue_describes_every_verb_that_exists() {
+        let listed: Vec<String> = tools()["verbs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect();
+        // Every advertised verb must dispatch to something. An agent that
+        // discovers a verb from the catalogue and cannot call it has been lied
+        // to by the one surface it is supposed to trust.
+        for name in &listed {
+            let err = dispatch(name, &json!({})).err().map(|e| e.to_string());
+            assert!(
+                !err.as_deref()
+                    .is_some_and(|e| e.starts_with("unknown verb")),
+                "catalogue advertises `{name}`, which dispatch does not know"
+            );
+        }
+        assert!(listed.contains(&"resolve".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_verb_lists_the_known_ones() {
+        let err = dispatch("resolv", &json!({})).unwrap_err().to_string();
+        assert!(err.contains("unknown verb"));
+        assert!(
+            err.contains("resolve"),
+            "should point at the near miss: {err}"
+        );
+    }
+
+    /// The premise, enforced at the tool boundary: you cannot build a claim
+    /// without shipping the thing that would prove you wrong.
+    #[test]
+    fn a_claim_cannot_be_built_without_a_falsifier() {
+        let (_, pk) = keys("author");
+        let err = claim_build(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "community": "eng", "domain": "ci",
+            "statement": "trust me", "confidence": 0.9,
+            "half_life": 900, "manifest": manifest(),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("module_path"), "got {err}");
+    }
+
+    #[test]
+    fn certainty_is_refused_at_the_boundary() {
+        let (_, pk) = keys("author");
+        for bad in [0.0, 1.0, 1.5, -0.1] {
+            let err = claim_build(&json!({
+                "pubkey": pk, "created_at": 1_700_000_000,
+                "community": "eng", "domain": "ci", "statement": "s",
+                "confidence": bad, "half_life": 900,
+                "manifest": manifest(), "module_path": CI_GREEN,
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("probability"), "confidence {bad} got: {err}");
+        }
+    }
+
+    #[test]
+    fn signed_events_verify_and_tampered_ones_do_not() {
+        let (claim, _, _) = a_claim(1_700_000_000);
+        let checked = event_verify(&json!({"events": [claim.clone()]})).unwrap();
+        assert_eq!(checked["all_valid"], json!(true));
+
+        let mut forged = claim;
+        forged["content"] = json!("something else entirely");
+        let checked = event_verify(&json!({"events": [forged]})).unwrap();
+        assert_eq!(checked["all_valid"], json!(false));
+    }
+
+    /// The whole pipeline, through the tool surface an agent actually calls.
+    #[test]
+    fn independent_probes_resolve_a_claim_end_to_end() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let probes: Vec<Value> = ["goose", "codex", "opus"]
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                a_probe(
+                    &claim,
+                    &experiment,
+                    &digest,
+                    m,
+                    "green",
+                    m,
+                    at + 10 * i as u64,
+                )
+            })
+            .collect();
+
+        let mut events = vec![claim];
+        events.extend(probes);
+        let out = resolve_verb(&json!({"events": events, "now": at + 60})).unwrap();
+
+        assert_eq!(out["resolution"]["verdict"]["status"], json!("supported"));
+        assert_eq!(out["resolution"]["verdict"]["n_eff"], json!(3.0));
+        assert!(out["rejected_events"].as_array().unwrap().is_empty());
+        // The verdict comes back ready to sign and publish back to the relay.
+        assert_eq!(out["verdict_event"]["kind"], json!(kinds::VERDICT));
+    }
+
+    #[test]
+    fn a_forged_event_is_rejected_and_named() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let honest = a_probe(&claim, &experiment, &digest, "goose", "green", "goose", at);
+        let mut forged = a_probe(&claim, &experiment, &digest, "codex", "green", "codex", at);
+        forged["sig"] = json!("00".repeat(64));
+
+        let out = resolve_verb(&json!({
+            "events": [claim, honest, forged.clone()], "now": at + 60,
+        }))
+        .unwrap();
+
+        let rejected = out["rejected_events"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["id"], forged["id"]);
+        assert_eq!(out["resolution"]["verdict"]["attestations"], json!(1));
+    }
+
+    /// Signature checking is on unless a caller deliberately turns it off, so
+    /// nobody reaches a verdict over unsigned events by forgetting a flag.
+    #[test]
+    fn signature_checking_defaults_to_on() {
+        let at = 1_700_000_000;
+        let (claim, _, _) = a_claim(at);
+        let mut unsigned_claim = claim;
+        unsigned_claim["sig"] = json!("00".repeat(64));
+
+        let err = resolve_verb(&json!({"events": [unsigned_claim.clone()], "now": at}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no valid claim"), "got {err}");
+        assert!(
+            err.contains("failed verification"),
+            "the error must say the claim was dropped, not that it was absent: {err}"
+        );
+
+        let ok = resolve_verb(&json!({
+            "events": [unsigned_claim], "now": at, "verify_signatures": false,
+        }));
+        assert!(
+            ok.is_ok(),
+            "explicitly opting out must still work for drafts"
+        );
+    }
+
+    #[test]
+    fn a_broken_policy_is_refused_rather_than_silently_ignored() {
+        let at = 1_700_000_000;
+        let (claim, _, _) = a_claim(at);
+        let err = resolve_verb(&json!({
+            "events": [claim], "now": at,
+            "policy": {"support_threshold": 0.1, "refute_threshold": 0.9},
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("policy"), "got {err}");
+    }
+
+    #[test]
+    fn replaying_a_log_produces_the_calibration_it_implies() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let probes: Vec<Value> = ["goose", "codex", "opus", "gemma"]
+            .iter()
+            .map(|m| a_probe(&claim, &experiment, &digest, m, "green", m, at))
+            .collect();
+
+        let mut events = vec![claim];
+        events.extend(probes);
+        let out = ledger_replay(&json!({"events": events, "now": at + 60})).unwrap();
+
+        assert_eq!(out["verdicts"].as_array().unwrap().len(), 1);
+        assert_eq!(out["verdicts"][0]["status"], json!("supported"));
+        assert_eq!(out["verdicts"][0]["settled"], json!(true));
+        // Author plus four probers, all in the `ci` domain.
+        assert_eq!(out["calibration"].as_array().unwrap().len(), 5);
+        for row in out["calibration"].as_array().unwrap() {
+            assert!(row["reliability"].as_f64().unwrap() > 0.5);
+            assert_eq!(row["domain"], json!("ci"));
+        }
+    }
+
+    #[test]
+    fn a_manifest_that_grants_nothing_is_reported_as_pure() {
+        let pure = manifest_digest(&json!({"observations": []})).unwrap();
+        assert_eq!(pure["pure"], json!(true));
+        let observing = manifest_digest(&json!({"observations": ["ci:status"]})).unwrap();
+        assert_eq!(observing["pure"], json!(false));
+        assert_ne!(pure["digest"], observing["digest"]);
+    }
+
+    #[test]
+    fn a_substituted_falsifier_is_refused_by_the_tool_surface() {
+        let err = probe_run(&json!({
+            "manifest": manifest(), "module_path": CI_GREEN,
+            "module_digest": "11".repeat(32),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("digest mismatch"), "got {err}");
     }
 }

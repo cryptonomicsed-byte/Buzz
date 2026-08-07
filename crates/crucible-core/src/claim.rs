@@ -146,15 +146,18 @@ impl Claim {
         };
 
         // ["falsifier", <module-digest>, "wasm", <manifest-digest>, <purity>]
-        let row = ev.tag_row("falsifier").ok_or(Error::MissingTag("falsifier"))?;
+        let row = ev
+            .tag_row("falsifier")
+            .ok_or(Error::MissingTag("falsifier"))?;
         let bad = |reason| Error::BadTag {
             tag: "falsifier",
             value: row.join(","),
             reason,
         };
-        let module = row.get(1).and_then(|s| parse_digest(s)).ok_or_else(|| {
-            bad("first value must be the module's 32-byte sha256, hex-encoded")
-        })?;
+        let module = row
+            .get(1)
+            .and_then(|s| parse_digest(s))
+            .ok_or_else(|| bad("first value must be the module's 32-byte sha256, hex-encoded"))?;
         if row.get(2).map(String::as_str) != Some("wasm") {
             return Err(bad("only the `wasm` falsifier type exists"));
         }
@@ -214,7 +217,12 @@ impl Claim {
                 hex::encode(self.falsifier.module),
                 "wasm".into(),
                 hex::encode(self.falsifier.manifest),
-                if self.falsifier.pure { "pure" } else { "observational" }.into(),
+                if self.falsifier.pure {
+                    "pure"
+                } else {
+                    "observational"
+                }
+                .into(),
             ],
         ];
         if let Some(e) = self.expiry {
@@ -274,7 +282,8 @@ mod tests {
         ]
     }
 
-    const OK_BODY: &str = r#"{"statement":"main is green","inputs":{"repo":"buzz","sha":"deadbeef"}}"#;
+    const OK_BODY: &str =
+        r#"{"statement":"main is green","inputs":{"repo":"buzz","sha":"deadbeef"}}"#;
 
     #[test]
     fn parses_a_well_formed_claim() {
@@ -292,7 +301,12 @@ mod tests {
     fn round_trips_its_tags() {
         let c = Claim::from_event(&event(ok_tags(), OK_BODY)).unwrap();
         let back = Claim::from_event(&event(c.to_unsigned_tags(), OK_BODY)).unwrap();
-        assert_eq!(c, back);
+
+        // The event id necessarily moves: re-emitting writes out the provenance
+        // the original event left implicit. Everything the tags carry must
+        // survive, and emitting twice must reach a fixed point.
+        assert_eq!(c.to_unsigned_tags(), back.to_unsigned_tags());
+        assert_eq!(Claim { id: c.id, ..back }, c);
     }
 
     /// The entire premise: an unfalsifiable assertion is not a claim.

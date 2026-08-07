@@ -92,7 +92,12 @@ pub struct Verdict {
 impl Verdict {
     pub fn to_unsigned_tags(&self) -> Vec<Vec<String>> {
         vec![
-            vec!["e".into(), self.claim.to_hex(), String::new(), "claim".into()],
+            vec![
+                "e".into(),
+                self.claim.to_hex(),
+                String::new(),
+                "claim".into(),
+            ],
             vec!["status".into(), self.status.as_str().into()],
             vec!["mass".into(), format!("{:.6}", self.mass)],
             vec!["neff".into(), format!("{:.6}", self.n_eff)],

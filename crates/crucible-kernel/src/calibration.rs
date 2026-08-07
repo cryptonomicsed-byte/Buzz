@@ -186,11 +186,7 @@ impl Ledger {
 
     /// Every scored (agent, domain) pair, sorted for stable output.
     pub fn report(&self) -> Vec<(String, Reliability)> {
-        let mut rows: Vec<_> = self
-            .entries
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut rows: Vec<_> = self.entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
     }
