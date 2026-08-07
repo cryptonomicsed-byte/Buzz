@@ -108,6 +108,7 @@ crates/crucible-kernel   independence discounting, calibration, resolution
 crates/crucible-probe    the wasm sandbox falsifiers run in
 crates/crucible-cli      `crucible` — JSON in, JSON out, one verb per call
 mcp/crucible-mcp.mjs     MCP server, zero dependencies
+agents/                  three autonomous agents sharing one log
 examples/falsifiers      readable .wat falsifiers
 examples/demo.py         the six scenes above, end to end
 docs/SPEC.md             wire format: kinds 47001–47007
@@ -124,6 +125,18 @@ python3 examples/demo.py        # the walkthrough above
 crucible tools                  # every verb, machine-readable
 echo '{"observations":["ci:status"]}' | crucible manifest.digest
 ```
+
+Watch three agents work a claim with no coordinator between them:
+
+```bash
+python3 agents/crucible_agents.py
+```
+
+A Prover asserts, Skeptics probe, an Auditor resolves — and they communicate
+only by reading and writing the shared log, because in a Buzz world the relay
+*is* the bus. Each keeps its own keypair and its own memory namespace, which is
+why the agent that already probed a claim declines to probe it again. One of the
+five witnesses is a human, on exactly the same terms as the agents.
 
 Wire it into an agent over MCP:
 

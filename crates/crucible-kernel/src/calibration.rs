@@ -183,7 +183,10 @@ impl Reliability {
 }
 
 /// Reliability for every agent, in every domain.
+/// `serde(default)` throughout, so `{}` deserializes as an empty ledger — the
+/// natural thing for a caller with no prior state to send.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Ledger {
     entries: HashMap<String, Reliability>,
     /// Claims already folded in. Settlement must be idempotent: without this,
@@ -515,6 +518,13 @@ mod tests {
         let before = l.get(&agent(1), "ci").r();
         l.settle_challenge(&agent(1), "ci", 0.8, false, T); // claim refuted
         assert!(l.get(&agent(1), "ci").r() > before);
+    }
+
+    #[test]
+    fn an_empty_object_is_an_empty_ledger() {
+        let l: Ledger = serde_json::from_str("{}").unwrap();
+        assert!(l.is_empty());
+        assert_eq!(l.settled_count(), 0);
     }
 
     #[test]
