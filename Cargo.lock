@@ -76,8 +76,12 @@ dependencies = [
  "crucible-core",
  "crucible-kernel",
  "crucible-probe",
+ "hex",
+ "k256",
  "serde",
  "serde_json",
+ "sha2",
+ "wat",
 ]
 
 [[package]]
