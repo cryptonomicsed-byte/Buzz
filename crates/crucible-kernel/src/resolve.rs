@@ -115,14 +115,48 @@ pub fn resolve(
     //    against a different module, manifest or inputs answers a different
     //    experiment, and pooling it would be the substrate lying to itself.
     let mut relevant: Vec<Attestation> = Vec::with_capacity(attestations.len());
+    let horizon = now.saturating_add(policy.max_clock_skew);
     for a in attestations {
-        match a.check_matches(claim) {
-            Ok(()) => relevant.push(a.clone()),
-            Err(e) => excluded.push(Exclusion {
+        let refusal = if let Err(e) = a.check_matches(claim) {
+            Some(e.to_string())
+        } else if !policy.admits(&a.attestor) {
+            // Not a member of this community. The one defence against an
+            // operator minting keys is that somebody had to admit them.
+            Some(format!(
+                "attestor {} is not on this community's roster",
+                a.attestor
+            ))
+        } else if a.created_at > horizon {
+            // Age drives decay, and `created_at` is self-declared. An event
+            // dated past the horizon would otherwise never age at all.
+            Some(format!(
+                "dated {}s beyond now, past the {}s clock-skew bound",
+                a.created_at - now,
+                policy.max_clock_skew
+            ))
+        } else {
+            None
+        };
+
+        match refusal {
+            None => relevant.push(a.clone()),
+            Some(reason) => excluded.push(Exclusion {
                 source: a.id,
-                reason: e.to_string(),
+                reason,
             }),
         }
+    }
+    // Bound the quadratic stage. Oldest-first, so the cap drops the newest
+    // arrivals rather than letting a flood evict the record.
+    relevant.sort_by_key(|a| (a.created_at, *a.id.as_bytes()));
+    if relevant.len() > policy.max_attestations {
+        for a in &relevant[policy.max_attestations..] {
+            excluded.push(Exclusion {
+                source: a.id,
+                reason: format!("beyond this community's cap of {}", policy.max_attestations),
+            });
+        }
+        relevant.truncate(policy.max_attestations);
     }
     let deduped: Vec<Attestation> = latest_per_attestor(&relevant)
         .into_iter()
@@ -131,13 +165,22 @@ pub fn resolve(
 
     // 2. Collect the distinct outputs the room saw. What this means depends on
     //    whether the falsifier claimed purity; see `decide`.
-    let mut digests: Vec<String> = deduped
+    let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+    for a in deduped
         .iter()
         .filter(|a| a.outcome != Outcome::Indeterminate)
-        .map(|a| hex::encode(a.output_digest))
-        .collect();
-    digests.sort();
-    digests.dedup();
+    {
+        *tally.entry(hex::encode(a.output_digest)).or_default() += 1;
+    }
+    let digests: Vec<String> = tally.keys().cloned().collect();
+    // How many attestors backed the *second* most popular output. One agent
+    // reporting an odd digest is far more likely to be broken or lying than the
+    // claim is to be broken, and a self-reported digest is free to fabricate —
+    // so a single voice must not be able to condemn a claim to a status that
+    // never resolves and never scores anyone.
+    let mut backing: Vec<usize> = tally.values().copied().collect();
+    backing.sort_unstable_by(|a, b| b.cmp(a));
+    let minority_digest_backing = backing.get(1).copied().unwrap_or(0);
 
     let age_of = |t: Timestamp| now.saturating_sub(t);
 
@@ -146,7 +189,15 @@ pub fn resolve(
     //    shouting 0.99 moves belief no further than its record allows; a proven
     //    one hedging at 0.6 moves it no further than its hedge allows.
     let odds = (claim.confidence / (1.0 - claim.confidence)).ln();
-    let author_weight = odds.abs().min(ledger.weight(&claim.author, &claim.domain));
+    // An author off the roster, or writing in a domain the community does not
+    // recognise, gets no evidentiary weight of its own. The claim still stands
+    // and can still be probed — what it cannot do is lend itself credibility.
+    let author_admitted = policy.admits(&claim.author) && policy.recognises(&claim.domain);
+    let author_weight = if author_admitted {
+        odds.abs().min(ledger.weight(&claim.author, &claim.domain))
+    } else {
+        0.0
+    };
     let author_decay = claim.decay(age_of(claim.created_at));
 
     struct Row<'a> {
@@ -249,6 +300,9 @@ pub fn resolve(
         .map(|c| c.novelty)
         .sum();
 
+    // Adding zero normalises a negative zero, which is arithmetically fine and
+    // reads as a bug in a report.
+    let n_eff = n_eff + 0.0;
     let log_odds = support - opposition;
     let mass = sigmoid(log_odds);
 
@@ -257,6 +311,7 @@ pub fn resolve(
         policy,
         now,
         &digests,
+        minority_digest_backing,
         deduped.len(),
         support + opposition,
         probe_support,
@@ -296,6 +351,7 @@ fn decide(
     policy: &Policy,
     now: Timestamp,
     digests: &[String],
+    minority_digest_backing: usize,
     probe_count: usize,
     total_evidence: f64,
     probe_support: f64,
@@ -308,7 +364,7 @@ fn decide(
     // meaningless. This applies only to *pure* falsifiers — one that reads the
     // world is supposed to return different things when the world differs, and
     // flagging that as a defect would condemn every probe worth running.
-    if claim.falsifier.pure && digests.len() > 1 {
+    if claim.falsifier.pure && digests.len() > 1 && minority_digest_backing >= 2 {
         return Status::Nondeterministic;
     }
     if claim.is_expired(now) {
@@ -356,9 +412,16 @@ pub fn settle(
     if !verdict.status.is_resolved() {
         return false;
     }
+    // Exactly once, ever. A resolver runs on a timer over the same log, so
+    // without this every tick pays every agent again for the same claim and
+    // reputation becomes a measure of how often somebody pressed the button.
+    if !ledger.mark_settled(&claim.id) {
+        return false;
+    }
     let truth = verdict.status == Status::Supported;
+    let at = verdict.computed_at;
 
-    ledger.record(&claim.author, &claim.domain, claim.confidence, truth);
+    ledger.record(&claim.author, &claim.domain, claim.confidence, truth, at);
 
     for a in latest_per_attestor(attestations) {
         // A probe is a categorical call, scored at the confidence a categorical
@@ -370,12 +433,12 @@ pub fn settle(
             Outcome::Fails => 0.1,
             Outcome::Indeterminate => continue,
         };
-        ledger.record(&a.attestor, &claim.domain, forecast, truth);
+        ledger.record(&a.attestor, &claim.domain, forecast, truth, at);
     }
 
     for c in challenges {
         if c.claim == claim.id {
-            ledger.settle_challenge(&c.challenger, &claim.domain, c.stake, truth);
+            ledger.settle_challenge(&c.challenger, &claim.domain, c.stake, truth, at);
         }
     }
     true

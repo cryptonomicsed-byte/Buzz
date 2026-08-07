@@ -76,6 +76,12 @@ pub fn discount(contributors: &[Contributor<'_>]) -> Vec<Discounted> {
     for (i, c) in contributors.iter().enumerate() {
         let redundancy = contributors[..i]
             .iter()
+            // Only evidence can explain evidence away. An abstention contributes
+            // nothing to belief, so letting it absorb a later attestor's novelty
+            // would be a free suppression primitive: publish one indeterminate
+            // probe wearing the provenance of an honest fleet, and the whole
+            // fleet's independent count collapses.
+            .filter(|earlier| earlier.sign != 0.0)
             .map(|earlier| correlation(c, earlier))
             .fold(0.0f64, f64::max);
         let novelty = (1.0 - redundancy).clamp(0.0, 1.0);
@@ -194,6 +200,26 @@ mod tests {
         assert_eq!(before[0], after[0]);
         assert_eq!(before[1], after[1]);
         assert!(after[2].novelty < 0.5, "the latecomer is largely redundant");
+    }
+
+    /// A zero-evidence attestation must not be able to devalue real ones.
+    /// Publishing one is free and unscored, so if it could soak novelty it
+    /// would be the cheapest attack in the system — and it would target other
+    /// people's *true* claims.
+    #[test]
+    fn an_abstention_cannot_suppress_later_evidence() {
+        let shared = prov("ci-runner-v3", "gha-ubuntu", true);
+        let honest: Vec<_> = (2..=6).map(|i| contrib(i, &shared, 1.0, 1.0)).collect();
+        let clean = effective_count(&honest, &discount(&honest));
+
+        let mut poisoned = vec![contrib(1, &shared, 1.0, 0.0)]; // indeterminate
+        poisoned.extend(honest);
+        let after = effective_count(&poisoned, &discount(&poisoned));
+
+        assert_eq!(
+            after, clean,
+            "an abstention wearing the fleet's provenance must change nothing"
+        );
     }
 
     #[test]

@@ -5,13 +5,14 @@ Every event below is really signed with a real secp256k1 key and really
 verified; every verdict comes out of the real kernel. Nothing is mocked, which
 is the only way a demo of an epistemic substrate is worth anything.
 
-The story it tells, in five scenes:
+The story it tells, in six scenes:
 
   1. A room agrees with itself, unanimously, and learns nothing.
   2. The same claim, checked by agents that could actually have disagreed.
-  3. One credible dissenter turns agreement into a controversy.
+  3. Dissent: one anonymous voice cannot freeze a claim, two can contest it.
   4. Time passes and the belief expires rather than persisting by default.
   5. The ledger records who was right, weighted by how loudly they said it.
+  6. The attack the arithmetic cannot stop, and the seam that does.
 
 Run:  python3 examples/demo.py
 """
@@ -169,8 +170,19 @@ def main():
         blind=True, at=T0 + 90)
     print(f"    its probe said: {dissent_run['outcome']} — \"{dissent_run['explanation']}\"")
 
-    contested = show("nobody averages this away:", crucible("resolve", {
+    lone = show("one unproven voice does not stop the room:", crucible("resolve", {
         "events": [claim_event] + independent + [dissent], "now": T0 + 120,
+    }))
+    assert lone["status"] != "contested"
+    print("    -> `contested` has no arbitration and costs its trigger nothing,")
+    print("       so one throwaway keypair must not be able to freeze a claim.")
+
+    second, _ = probe(
+        claim, experiment, key("prover/skeptic-2"),
+        ci_status="red", lineage="another-model", env="another-host",
+        blind=True, at=T0 + 100)
+    contested = show("two independent dissenters are a controversy:", crucible("resolve", {
+        "events": [claim_event] + independent + [dissent, second], "now": T0 + 120,
     }))
     assert contested["status"] == "contested"
     print("    -> the room is told there is an argument, not handed a shrug.")
@@ -199,6 +211,38 @@ def main():
               f" reliability {row['reliability']:.3f}"
               f"  weight {row['weight']:.2f}  brier {brier}")
     print("    -> nobody configured these. They are what the log implies.")
+
+    # ---------------------------------------------------------------- scene 6
+    print("\n" + "-" * 72)
+    print("SCENE 6  The attack the arithmetic cannot stop, and the seam that")
+    print("         does. One operator, three fresh keys, three invented")
+    print("         lineages -- indistinguishable from three real agents.")
+
+    sybils = [
+        probe(claim, experiment, key(f"sybil/{i}"),
+              ci_status="green", lineage=f"totally-different-model-{i}",
+              env=f"totally-different-host-{i}", blind=True, at=T0 + i)[0]
+        for i in range(1, 4)
+    ]
+    open_room = crucible("resolve", {
+        "events": [claim_event] + sybils, "now": T0 + 60,
+    })["resolution"]["verdict"]
+    print(f"    with no roster:  {open_room['status'].upper()}"
+          f"  n_eff {open_room['n_eff']:.2f}  <- three keypairs, one second")
+
+    # The community's membership set, as Buzz's own admission control defines it.
+    roster = [author[1]] + [key(f"prover/{n}")[1]
+                            for n in ["goose-gpt", "codex", "claude-opus-5"]]
+    closed = crucible("resolve", {
+        "events": [claim_event] + sybils, "now": T0 + 60,
+        "policy": {"roster": roster},
+    })
+    v = closed["resolution"]["verdict"]
+    print(f"    with a roster:   {v['status'].upper()}  n_eff {v['n_eff']:.2f}")
+    for ex in closed["resolution"]["excluded"][:1]:
+        print(f"    excluded: {ex['reason'][:64]}...")
+    print("    -> no amount of arithmetic over the events can tell these apart.")
+    print("       Membership is Buzz's job, and this is where it plugs in.")
 
     print("\n" + "=" * 72)
     print("Every event above was signed and verified; every number came from")

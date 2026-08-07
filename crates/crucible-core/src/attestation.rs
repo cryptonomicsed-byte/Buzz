@@ -65,6 +65,13 @@ pub struct Provenance {
     /// True when the attestor ran the falsifier *before* seeing any prior
     /// attestation or verdict on this claim. An informed attestor is anchored by
     /// what it read, so it carries strictly less independent information.
+    ///
+    /// Self-reported and unverified, like `lineage` and `env` — and claiming it
+    /// only ever *raises* how much your agreement counts, so the incentive runs
+    /// the wrong way. A commit-then-reveal round (publish `H(outcome ‖ nonce)`
+    /// before any verdict exists, reveal after) would make blindness checkable
+    /// rather than asserted. That is not implemented, and until it is, this
+    /// field is the softest part of the substrate.
     pub blind: bool,
 }
 
@@ -114,8 +121,9 @@ pub struct Attestation {
     /// which is a defect in the *claim*, and worth surfacing rather than
     /// averaging away.
     pub output_digest: [u8; 32],
-    /// Fuel consumed by the sandbox. A large divergence in fuel on identical
-    /// inputs is a second, cheaper non-determinism signal.
+    /// Fuel consumed by the sandbox. Recorded for readers and for cost
+    /// accounting; the kernel does not currently use it, though divergent fuel
+    /// on identical inputs would be a cheap second non-determinism signal.
     pub fuel: u64,
     pub provenance: Provenance,
 }

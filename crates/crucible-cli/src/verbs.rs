@@ -381,13 +381,22 @@ pub fn resolve_verb(input: &Value) -> Result<Value> {
         now,
     );
 
-    let verdict_event = unsigned(
-        &g.claim.author,
-        kinds::VERDICT,
-        now,
-        resolution.verdict.to_unsigned_tags(),
-        String::new(),
-    );
+    // Authored by whoever ran the resolver, never by the claimant. A judgment
+    // the judged party signs is not a judgment. Callers that only want the
+    // numbers may omit `resolver` and get no event to publish.
+    let verdict_event = match input.get("resolver").and_then(Value::as_str) {
+        Some(hex) => {
+            let resolver = PubKey::parse_hex(hex).map_err(|e| anyhow!("resolver: {e}"))?;
+            Some(serde_json::to_value(unsigned(
+                &resolver,
+                kinds::VERDICT,
+                now,
+                resolution.verdict.to_unsigned_tags(),
+                String::new(),
+            ))?)
+        }
+        None => None,
+    };
 
     Ok(json!({
         "resolution": resolution,
@@ -609,7 +618,7 @@ pub fn tools() -> Value {
             {
                 "name": "resolve",
                 "summary": "Derive a claim's epistemic status from signed events. Pure in (events, ledger, policy, now) — rerun it to check the answer.",
-                "input": {"events": "[event]", "claim": "hex?", "now": "unix", "policy": "policy?", "ledger": "ledger?", "verify_signatures": "bool?"},
+                "input": {"events": "[event]", "claim": "hex?", "now": "unix", "policy": "policy?", "ledger": "ledger?", "verify_signatures": "bool?", "resolver": "hex? — pubkey to author the verdict event; never the claimant"},
             },
             {
                 "name": "ledger.replay",
@@ -825,13 +834,75 @@ mod tests {
 
         let mut events = vec![claim];
         events.extend(probes);
-        let out = resolve_verb(&json!({"events": events, "now": at + 60})).unwrap();
+        let (_, resolver) = keys("resolver");
+        let out = resolve_verb(&json!({
+            "events": events, "now": at + 60, "resolver": resolver,
+        }))
+        .unwrap();
 
         assert_eq!(out["resolution"]["verdict"]["status"], json!("supported"));
         assert_eq!(out["resolution"]["verdict"]["n_eff"], json!(3.0));
         assert!(out["rejected_events"].as_array().unwrap().is_empty());
         // The verdict comes back ready to sign and publish back to the relay.
         assert_eq!(out["verdict_event"]["kind"], json!(kinds::VERDICT));
+    }
+
+    /// A judgment the judged party signs is not a judgment. The verdict event
+    /// is authored by whoever ran the resolver, and callers that do not name
+    /// one get the numbers without an event to publish.
+    #[test]
+    fn a_verdict_is_never_authored_by_the_claimant() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let probes: Vec<Value> = ["goose", "codex", "opus"]
+            .iter()
+            .map(|m| a_probe(&claim, &experiment, &digest, m, "green", m, at))
+            .collect();
+        let mut events = vec![claim.clone()];
+        events.extend(probes);
+
+        let anonymous = resolve_verb(&json!({"events": events.clone(), "now": at + 60})).unwrap();
+        assert_eq!(anonymous["verdict_event"], Value::Null);
+
+        let (_, resolver) = keys("auditor");
+        let signed = resolve_verb(&json!({
+            "events": events, "now": at + 60, "resolver": resolver,
+        }))
+        .unwrap();
+        // The id is over the resolver's pubkey, so it cannot match one derived
+        // from the claimant's.
+        assert_ne!(signed["verdict_event"]["id"], claim["id"]);
+        assert_ne!(resolver, claim["pubkey"].as_str().unwrap());
+    }
+
+    /// The roster is the seam for the attack the kernel cannot compute its way
+    /// out of, and it has to be reachable from the tool surface an agent uses.
+    #[test]
+    fn a_roster_in_the_policy_excludes_unadmitted_attestors() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let probes: Vec<Value> = ["goose", "codex", "opus"]
+            .iter()
+            .map(|m| a_probe(&claim, &experiment, &digest, m, "green", m, at))
+            .collect();
+        let admitted = probes[0]["pubkey"].as_str().unwrap().to_string();
+        let mut events = vec![claim.clone()];
+        events.extend(probes);
+
+        let out = resolve_verb(&json!({
+            "events": events, "now": at + 60,
+            "policy": { "roster": [claim["pubkey"], admitted] },
+        }))
+        .unwrap();
+
+        assert_eq!(out["resolution"]["verdict"]["attestations"], json!(1));
+        assert_eq!(
+            out["resolution"]["verdict"]["status"],
+            json!("insufficient")
+        );
+        let excluded = out["resolution"]["excluded"].as_array().unwrap();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded[0]["reason"].as_str().unwrap().contains("roster"));
     }
 
     #[test]

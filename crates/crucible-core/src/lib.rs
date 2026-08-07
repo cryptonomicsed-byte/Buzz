@@ -7,7 +7,9 @@
 //! agent keypair the agent already uses to speak in a Buzz channel. Nothing here
 //! opens a socket, reads a clock, or allocates a thread — the crate is a pure
 //! function of bytes so that two agents on two machines derive byte-identical
-//! event ids and byte-identical verdict inputs.
+//! event ids and byte-identical verdict inputs. (The *verdict* itself involves
+//! transcendental functions and is only near-certainly identical across libm
+//! implementations; see `crucible_kernel`.)
 //!
 //! The layering mirrors `buzz-core`: this crate knows types, wire format and
 //! signature verification, and nothing else.

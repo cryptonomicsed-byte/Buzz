@@ -125,7 +125,7 @@ impl ProbeSpec {
 /// An agent with a strong, earned track record in `domain`.
 fn proven(ledger: &mut Ledger, agent: u8, domain: &str) {
     for _ in 0..200 {
-        ledger.record(&key(agent), domain, 0.95, true);
+        ledger.record(&key(agent), domain, 0.95, true, T0);
     }
 }
 
@@ -249,11 +249,59 @@ fn independent_disagreement_is_contested_not_averaged() {
         ProbeSpec::independent(1, Outcome::Holds).build(&claim),
         ProbeSpec::independent(2, Outcome::Holds).build(&claim),
         ProbeSpec::independent(3, Outcome::Fails).build(&claim),
+        ProbeSpec::independent(4, Outcome::Fails).build(&claim),
     ];
     let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
 
     assert_eq!(r.verdict.status, Status::Contested);
     assert!(r.verdict.support > 0.0 && r.verdict.opposition > 0.0);
+}
+
+/// One credible dissenter is still a controversy — an earned record buys the
+/// right to stop the room on your own.
+#[test]
+fn a_single_proven_dissenter_contests() {
+    let claim = a_claim();
+    let mut ledger = Ledger::new();
+    proven(&mut ledger, 3, "ci");
+    let probes = [
+        ProbeSpec::independent(1, Outcome::Holds).build(&claim),
+        ProbeSpec::independent(2, Outcome::Holds).build(&claim),
+        ProbeSpec::independent(3, Outcome::Fails).build(&claim),
+    ];
+    assert_eq!(
+        resolve_at(&claim, &probes, &ledger, T0).verdict.status,
+        Status::Contested
+    );
+}
+
+/// …but one anonymous key must not be able to freeze a claim.
+///
+/// `Contested` has no arbitration, no expiry and no cost to whoever triggered
+/// it: `settle` never runs, so nobody is ever scored for it. If a single fresh
+/// keypair could reach it, suppressing any true claim in the room would be free
+/// and permanent.
+#[test]
+fn one_unproven_dissenter_cannot_freeze_a_claim() {
+    let claim = a_claim();
+    let supported: Vec<_> = (1..=4)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    assert_eq!(
+        resolve_at(&claim, &supported, &Ledger::new(), T0)
+            .verdict
+            .status,
+        Status::Supported
+    );
+
+    let mut with_dissent = supported;
+    with_dissent.push(ProbeSpec::independent(9, Outcome::Fails).build(&claim));
+    let r = resolve_at(&claim, &with_dissent, &Ledger::new(), T0);
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert!(
+        r.verdict.opposition > 0.0,
+        "the dissent must still be visible in the record"
+    );
 }
 
 /// …but one straggler must not be able to freeze a well-established claim
@@ -291,8 +339,9 @@ fn ignorance_and_controversy_are_different_statuses() {
 
     let probes = [
         ProbeSpec::independent(1, Outcome::Holds).build(&claim),
-        ProbeSpec::independent(2, Outcome::Fails).build(&claim),
+        ProbeSpec::independent(2, Outcome::Holds).build(&claim),
         ProbeSpec::independent(3, Outcome::Fails).build(&claim),
+        ProbeSpec::independent(4, Outcome::Fails).build(&claim),
     ];
     let controversy = resolve_at(&claim, &probes, &Ledger::new(), T0);
     assert_eq!(controversy.verdict.status, Status::Contested);
@@ -318,11 +367,34 @@ fn divergent_output_digests_poison_a_pure_claim() {
     // Same module, same inputs, same verdict — but a different output hash.
     // The falsifier hashed something it did not declare: a clock, a path, a
     // random seed. Everything downstream of it is now unreliable.
+    probes[4].output_digest = [99; 32];
     probes[5].output_digest = [99; 32];
 
     let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
     assert_eq!(r.verdict.status, Status::Nondeterministic);
     assert_eq!(r.output_digests.len(), 2);
+}
+
+/// `output_digest` is self-reported, and `Nondeterministic` is an absorbing
+/// status that never resolves and never scores anyone — so a single fabricated
+/// digest must not be able to condemn a claim permanently. One odd voice is far
+/// likelier to be a broken or lying prober than a broken claim; two independent
+/// ones are worth believing.
+#[test]
+fn one_fabricated_digest_cannot_condemn_a_pure_claim() {
+    let claim = a_pure_claim();
+    let mut probes: Vec<_> = (1..=6)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    probes[5].output_digest = [0x5a; 32];
+
+    let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert_eq!(
+        r.output_digests.len(),
+        2,
+        "the divergence is still on the record for a reader to weigh"
+    );
 }
 
 /// The other half of the distinction, and the reason it exists. An
@@ -339,6 +411,7 @@ fn divergent_output_does_not_poison_an_observational_claim() {
         ProbeSpec::independent(1, Outcome::Holds).build(&claim),
         ProbeSpec::independent(2, Outcome::Holds).build(&claim),
         ProbeSpec::independent(3, Outcome::Fails).build(&claim),
+        ProbeSpec::independent(4, Outcome::Fails).build(&claim),
     ];
 
     let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
@@ -533,7 +606,7 @@ fn a_discredited_author_contributes_nothing() {
     let claim = claim_with(0.99);
     let mut ledger = Ledger::new();
     for _ in 0..200 {
-        ledger.record(&key(200), "ci", 0.95, false);
+        ledger.record(&key(200), "ci", 0.95, false, T0);
     }
 
     let r = resolve_at(&claim, &[], &ledger, T0);
@@ -604,20 +677,49 @@ fn every_contribution_is_fully_traced() {
     );
 }
 
-/// A clock that runs backwards must not produce evidence stronger than fresh.
+/// `created_at` is self-declared and drives decay, so an event dated into the
+/// future would never age: a claim with a fifteen-minute half-life, permanently
+/// fresh, from one integer. Beyond the skew bound the evidence is refused.
 #[test]
-fn future_dated_events_do_not_gain_weight() {
+fn future_dated_evidence_is_refused_rather_than_never_ageing() {
     let claim = a_claim();
-    let mut ahead = ProbeSpec::independent(1, Outcome::Holds).build(&claim);
-    ahead.created_at = T0 + 10_000;
+    let mut ahead: Vec<_> = (1..=4)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    for a in &mut ahead {
+        a.created_at = T0 + 100 * HALF_LIFE;
+    }
 
-    let r = resolve_at(&claim, &[ahead], &Ledger::new(), T0);
+    let r = resolve_at(&claim, &ahead, &Ledger::new(), T0 + HALF_LIFE * 50);
+    assert_eq!(r.verdict.attestations, 0);
+    assert_eq!(r.excluded.len(), 4);
+    assert!(
+        r.excluded[0].reason.contains("clock-skew"),
+        "got {}",
+        r.excluded[0].reason
+    );
+    assert_ne!(r.verdict.status, Status::Supported);
+}
+
+/// Ordinary clock jitter is not an attack, and must not cost an honest agent
+/// its probe.
+#[test]
+fn evidence_within_the_skew_bound_is_accepted() {
+    let claim = a_claim();
+    let mut jittery = ProbeSpec::independent(1, Outcome::Holds).build(&claim);
+    jittery.created_at = T0 + 30;
+
+    let r = resolve_at(&claim, &[jittery], &Ledger::new(), T0);
+    assert_eq!(r.verdict.attestations, 1);
     let probe = r
         .contributions
         .iter()
         .find(|c| c.role == Role::Probe)
         .unwrap();
-    assert_eq!(probe.decay, 1.0);
+    assert_eq!(
+        probe.decay, 1.0,
+        "a slightly-ahead clock does not gain weight"
+    );
 }
 
 #[test]
@@ -808,5 +910,155 @@ fn reliability_earned_in_one_round_carries_into_the_next() {
     assert!(
         after > before + 0.1,
         "a proven agent's word must carry further: {before} -> {after}"
+    );
+}
+
+// ------------------------------------------------------- adversarial hardening
+
+/// Settlement must be idempotent. A resolver runs on a timer over the same log;
+/// without this, every tick pays every agent again for the same claim and
+/// reputation measures how often somebody pressed the button.
+#[test]
+fn a_claim_settles_exactly_once_however_often_it_is_replayed() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=4)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let mut ledger = Ledger::new();
+    let r = resolve_at(&claim, &probes, &ledger, T0);
+
+    assert!(settle(&mut ledger, &claim, &probes, &[], &r.verdict));
+    let once = ledger.get(&key(1), "ci").r();
+
+    for _ in 0..50 {
+        assert!(
+            !settle(&mut ledger, &claim, &probes, &[], &r.verdict),
+            "a replayed settlement must be refused"
+        );
+    }
+    assert_eq!(ledger.get(&key(1), "ci").r(), once);
+    assert_eq!(ledger.settled_count(), 1);
+}
+
+/// The roster is the seam for the one attack the kernel cannot compute its way
+/// out of: an operator minting keys. Nothing in the events distinguishes twenty
+/// sock puppets from twenty agents, so the answer has to come from outside —
+/// from the community's own membership set.
+#[test]
+fn attestors_outside_the_roster_are_excluded_with_a_reason() {
+    let claim = a_claim();
+    let sybils: Vec<_> = (1..=5)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+
+    // With no roster, five fresh keys look like five witnesses.
+    let open = resolve_at(&claim, &sybils, &Ledger::new(), T0);
+    assert_eq!(open.verdict.status, Status::Supported);
+
+    // With one, only the admitted members are heard.
+    let policy = Policy {
+        roster: Some([key(200), key(1), key(2)].into_iter().collect()),
+        ..Policy::default()
+    };
+    let closed = resolve(&claim, &sybils, &[], &Ledger::new(), &policy, T0);
+    assert_eq!(closed.verdict.attestations, 2);
+    assert_eq!(closed.excluded.len(), 3);
+    assert!(closed.excluded[0].reason.contains("roster"));
+    assert_eq!(closed.verdict.status, Status::Insufficient);
+}
+
+/// An author off the roster may still make a claim — anyone may — but it lends
+/// itself no credibility while doing so.
+#[test]
+fn an_unadmitted_author_carries_no_weight_of_its_own() {
+    let claim = claim_with(0.99);
+    let mut ledger = Ledger::new();
+    proven(&mut ledger, 200, "ci");
+
+    let policy = Policy {
+        roster: Some([key(1)].into_iter().collect()),
+        ..Policy::default()
+    };
+    let r = resolve(&claim, &[], &[], &ledger, &policy, T0);
+    assert_eq!(r.verdict.mass, 0.5);
+    assert_eq!(r.verdict.support, 0.0);
+}
+
+/// The domain is chosen by the claim's author and reliability is keyed on it,
+/// so an unconstrained domain is a reset button an adversary can press per
+/// claim — putting every hard-won attestor back beside the newcomers.
+#[test]
+fn a_domain_the_community_does_not_recognise_earns_the_author_nothing() {
+    let mut claim = claim_with(0.99);
+    claim.domain = "migration-safety-q3".into();
+    let mut ledger = Ledger::new();
+    proven(&mut ledger, 200, "migration-safety-q3");
+
+    let policy = Policy {
+        domains: Some(
+            ["ci".to_string(), "security".to_string()]
+                .into_iter()
+                .collect(),
+        ),
+        ..Policy::default()
+    };
+    let r = resolve(&claim, &[], &[], &ledger, &policy, T0);
+    assert_eq!(r.verdict.support, 0.0);
+}
+
+/// Resolution is quadratic in the attestation count and the input arrives from
+/// a relay, so the ceiling cannot be "however many turned up".
+#[test]
+fn attestations_beyond_the_cap_are_dropped_oldest_first() {
+    let claim = a_claim();
+    let flood: Vec<_> = (1..=200)
+        .map(|n| {
+            let mut a = ProbeSpec::independent((n % 250) as u8, Outcome::Holds).build(&claim);
+            a.attestor = PubKey::from_bytes([(n % 256) as u8; 32]);
+            a.id = EventId::from_bytes([(n % 256) as u8; 32]);
+            a.created_at = T0 + n as u64;
+            a
+        })
+        .collect();
+
+    let policy = Policy {
+        max_attestations: 10,
+        ..Policy::default()
+    };
+    let r = resolve(&claim, &flood, &[], &Ledger::new(), &policy, T0 + 500);
+    assert!(r.verdict.attestations <= 10);
+    assert!(r.excluded.iter().any(|e| e.reason.contains("cap")));
+}
+
+/// An indeterminate probe is free to publish and is never scored. If it could
+/// also soak the novelty of agents that share its declared provenance, it would
+/// be the cheapest attack in the system — and it would target true claims.
+#[test]
+fn a_free_abstention_cannot_suppress_an_honest_fleet() {
+    let claim = a_claim();
+    let fleet: Vec<_> = (1..=5)
+        .map(|n| {
+            let mut p = ProbeSpec::new(n, Outcome::Holds);
+            p.lineage = "ci-runner-v3";
+            p.env = "gha-ubuntu";
+            p.build(&claim)
+        })
+        .collect();
+    let clean = resolve_at(&claim, &fleet, &Ledger::new(), T0).verdict.n_eff;
+
+    let mut poisoned = vec![{
+        let mut p = ProbeSpec::new(99, Outcome::Indeterminate);
+        p.lineage = "ci-runner-v3";
+        p.env = "gha-ubuntu";
+        p.build(&claim)
+    }];
+    poisoned.extend(fleet);
+    let after = resolve_at(&claim, &poisoned, &Ledger::new(), T0)
+        .verdict
+        .n_eff;
+
+    assert!(
+        (after - clean).abs() < 1e-12,
+        "an abstention wearing the fleet's provenance changed n_eff {clean} -> {after}"
     );
 }
