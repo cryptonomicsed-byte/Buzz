@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/crucible-core",
+    "crates/crucible-kernel",
+    "crates/crucible-probe",
+    "crates/crucible-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/cryptonomicsed-byte/Buzz"
+
+[workspace.dependencies]
+crucible-core = { path = "crates/crucible-core" }
+crucible-kernel = { path = "crates/crucible-kernel" }
+crucible-probe = { path = "crates/crucible-probe" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "alloc"] }
+wasmi = { version = "0.40", default-features = false }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
