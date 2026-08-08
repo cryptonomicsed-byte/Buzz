@@ -97,25 +97,24 @@ fn latest_per_attestor(attestations: &[Attestation]) -> Vec<&Attestation> {
     best
 }
 
-/// Resolve a claim against everything known about it.
+/// Evidence this community will actually count, and what it refused.
 ///
-/// `now` is supplied rather than read so that replaying history reproduces the
-/// verdicts history actually saw.
-pub fn resolve(
+/// Extracted so that [`resolve`] and [`settle`] cannot disagree. They used to:
+/// the roster and clock-skew filters lived inside `resolve`, and `settle` was
+/// handed the raw list — so a key nobody admitted could farm reputation in the
+/// community's ledger for evidence the room had explicitly thrown away, and
+/// cash it in the moment it was admitted. A verdict and the ledger that follows
+/// from it have to be computed over the same set or neither means anything.
+pub fn admissible(
     claim: &Claim,
     attestations: &[Attestation],
-    challenges: &[Challenge],
-    ledger: &Ledger,
     policy: &Policy,
     now: Timestamp,
-) -> Resolution {
+) -> (Vec<Attestation>, Vec<Exclusion>) {
     let mut excluded = Vec::new();
-
-    // 1. Discard evidence that is about a different question. An attestation
-    //    against a different module, manifest or inputs answers a different
-    //    experiment, and pooling it would be the substrate lying to itself.
     let mut relevant: Vec<Attestation> = Vec::with_capacity(attestations.len());
     let horizon = now.saturating_add(policy.max_clock_skew);
+
     for a in attestations {
         let refusal = if let Err(e) = a.check_matches(claim) {
             Some(e.to_string())
@@ -146,6 +145,7 @@ pub fn resolve(
             }),
         }
     }
+
     // Bound the quadratic stage. Oldest-first, so the cap drops the newest
     // arrivals rather than letting a flood evict the record.
     relevant.sort_by_key(|a| (a.created_at, *a.id.as_bytes()));
@@ -158,10 +158,53 @@ pub fn resolve(
         }
         relevant.truncate(policy.max_attestations);
     }
-    let deduped: Vec<Attestation> = latest_per_attestor(&relevant)
+
+    let deduped = latest_per_attestor(&relevant)
         .into_iter()
         .cloned()
         .collect();
+    (deduped, excluded)
+}
+
+/// Whether the claim itself is in effect at `now`.
+///
+/// A claim dated into the future computes its own age as zero, so its author's
+/// assertion never decays — and because that assertion alone keeps total
+/// evidence above the decay floor, the claim can never go stale either. One
+/// integer buys a belief that outlives every piece of evidence in it. The
+/// horizon that already guarded attestations has to guard the claim too.
+fn claim_in_effect(claim: &Claim, policy: &Policy, now: Timestamp) -> bool {
+    claim.created_at <= now.saturating_add(policy.max_clock_skew)
+}
+
+/// Resolve a claim against everything known about it.
+///
+/// `now` is supplied rather than read so that replaying history reproduces the
+/// verdicts history actually saw.
+pub fn resolve(
+    claim: &Claim,
+    attestations: &[Attestation],
+    challenges: &[Challenge],
+    ledger: &Ledger,
+    policy: &Policy,
+    now: Timestamp,
+) -> Resolution {
+    // 1. Only evidence this community counts, filtered identically to `settle`.
+    let (deduped, mut excluded) = admissible(claim, attestations, policy, now);
+
+    // A claim from the future is not in effect. Its author gets no weight, and
+    // nothing here can resolve until the clock catches up.
+    let in_effect = claim_in_effect(claim, policy, now);
+    if !in_effect {
+        excluded.push(Exclusion {
+            source: claim.id,
+            reason: format!(
+                "claim is dated {}s beyond now, past the {}s clock-skew bound",
+                claim.created_at.saturating_sub(now),
+                policy.max_clock_skew
+            ),
+        });
+    }
 
     // 2. Collect the distinct outputs the room saw. What this means depends on
     //    whether the falsifier claimed purity; see `decide`.
@@ -182,7 +225,20 @@ pub fn resolve(
     backing.sort_unstable_by(|a, b| b.cmp(a));
     let minority_digest_backing = backing.get(1).copied().unwrap_or(0);
 
+    // A half-life longer than the community permits decays imperceptibly, which
+    // is the same immortality by another route. Clamp it, and say so.
+    let effective_half_life = claim.half_life.min(policy.max_half_life);
+    if claim.half_life > policy.max_half_life {
+        excluded.push(Exclusion {
+            source: claim.id,
+            reason: format!(
+                "declared half-life {}s clamped to this community's maximum of {}s",
+                claim.half_life, policy.max_half_life
+            ),
+        });
+    }
     let age_of = |t: Timestamp| now.saturating_sub(t);
+    let decay_at = |t: Timestamp| (-(age_of(t) as f64) / effective_half_life as f64).exp2();
 
     // 3. The author's own forecast is evidence, bounded by both their track
     //    record and the confidence they were willing to state. An unproven agent
@@ -192,13 +248,14 @@ pub fn resolve(
     // An author off the roster, or writing in a domain the community does not
     // recognise, gets no evidentiary weight of its own. The claim still stands
     // and can still be probed — what it cannot do is lend itself credibility.
-    let author_admitted = policy.admits(&claim.author) && policy.recognises(&claim.domain);
+    let author_admitted =
+        in_effect && policy.admits(&claim.author) && policy.recognises(&claim.domain);
     let author_weight = if author_admitted {
         odds.abs().min(ledger.weight(&claim.author, &claim.domain))
     } else {
         0.0
     };
-    let author_decay = claim.decay(age_of(claim.created_at));
+    let author_decay = decay_at(claim.created_at);
 
     struct Row<'a> {
         source: EventId,
@@ -233,7 +290,7 @@ pub fn resolve(
             role: Role::Probe,
             outcome: a.outcome,
             raw: ledger.weight(&a.attestor, &claim.domain),
-            decay: claim.decay(age_of(a.created_at)),
+            decay: decay_at(a.created_at),
             sign: a.outcome.sign(),
             provenance: &a.provenance,
         });
@@ -294,10 +351,15 @@ pub fn resolve(
 
     // Only probes count toward independence. The author asserting is not
     // somebody checking, however trusted the author is.
+    // Independence ages with the evidence that carries it. An unaged count
+    // would let a probe from years ago satisfy `min_n_eff` today, which is the
+    // opposite of what "a claim nobody re-checks goes stale" is supposed to
+    // mean: the room would keep clearing the independence bar on witnesses that
+    // no longer say anything about the present.
     let n_eff: f64 = contributions
         .iter()
         .filter(|c| c.role == Role::Probe && c.outcome != Outcome::Indeterminate)
-        .map(|c| c.novelty)
+        .map(|c| c.novelty * c.decay)
         .sum();
 
     // Adding zero normalises a negative zero, which is arithmetically fine and
@@ -306,19 +368,23 @@ pub fn resolve(
     let log_odds = support - opposition;
     let mass = sigmoid(log_odds);
 
-    let status = decide(
-        claim,
-        policy,
-        now,
-        &digests,
-        minority_digest_backing,
-        deduped.len(),
-        support + opposition,
-        probe_support,
-        probe_opposition,
-        n_eff,
-        mass,
-    );
+    let status = if in_effect {
+        decide(
+            claim,
+            policy,
+            now,
+            &digests,
+            minority_digest_backing,
+            deduped.len(),
+            support + opposition,
+            probe_support,
+            probe_opposition,
+            n_eff,
+            mass,
+        )
+    } else {
+        Status::Insufficient
+    };
 
     // 4. Challenges are recorded but deliberately move no belief on their own.
     //    A challenge is a bet, not a measurement; it earns its influence by
@@ -408,6 +474,7 @@ pub fn settle(
     attestations: &[Attestation],
     challenges: &[Challenge],
     verdict: &Verdict,
+    policy: &Policy,
 ) -> bool {
     if !verdict.status.is_resolved() {
         return false;
@@ -423,7 +490,12 @@ pub fn settle(
 
     ledger.record(&claim.author, &claim.domain, claim.confidence, truth, at);
 
-    for a in latest_per_attestor(attestations) {
+    // Exactly the evidence the verdict was computed over. Scoring anything the
+    // resolver refused would let an unadmitted key build a reputation on
+    // evidence the room never counted.
+    let (counted, _) = admissible(claim, attestations, policy, at);
+
+    for a in &counted {
         // A probe is a categorical call, scored at the confidence a categorical
         // call implies. Indeterminate results are not forecasts and are not
         // scored — punishing an honest "I could not tell" would train agents to
@@ -437,7 +509,7 @@ pub fn settle(
     }
 
     for c in challenges {
-        if c.claim == claim.id {
+        if c.claim == claim.id && policy.admits(&c.challenger) {
             ledger.settle_challenge(&c.challenger, &claim.domain, c.stake, truth, at);
         }
     }

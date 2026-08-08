@@ -86,6 +86,12 @@ fn falsifier_root() -> std::path::PathBuf {
 /// whole filesystem: point it at `/etc/shadow` or a `.env`, get back a SHA-256
 /// that is crackable offline for anything guessable. Both paths are
 /// canonicalised before comparison so `..` and symlinks cannot walk out.
+///
+/// The check is canonicalise-then-read, so a local actor with write access to
+/// the store can swap a file between the two. That buys them nothing they did
+/// not already have — they can write falsifiers into the store directly — but
+/// the boundary is against a remote agent being steered, not against a local
+/// one already inside it.
 fn resolve_in_store(requested: &str) -> Result<std::path::PathBuf> {
     let root = falsifier_root();
     let canonical_root = root.canonicalize().with_context(|| {
@@ -123,6 +129,11 @@ fn resolve_in_store(requested: &str) -> Result<std::path::PathBuf> {
 /// A `.wat` path is assembled on the way in. Falsifiers are small predicates,
 /// and a reviewer deciding whether to run one is far better served by readable
 /// text than by a binary they have to take on trust.
+/// Falsifiers are small predicates by construction. A hostile claim steering an
+/// agent into a hundred-megabyte module costs the prober that memory plus a
+/// parse — and the fuel cap governs execution only, not validation.
+pub const MAX_MODULE_BYTES: usize = 1 << 20;
+
 fn module_bytes(v: &Value) -> Result<Vec<u8>> {
     let raw = match (v.get("module_path"), v.get("module_hex")) {
         (Some(p), None) => {
@@ -150,6 +161,13 @@ fn module_bytes(v: &Value) -> Result<Vec<u8>> {
         (Some(_), Some(_)) => bail!("give module_path or module_hex, not both"),
         (None, None) => bail!("give one of module_path or module_hex"),
     };
+    if raw.len() > MAX_MODULE_BYTES {
+        bail!(
+            "falsifier is {} bytes, over the {MAX_MODULE_BYTES}-byte limit; \
+             falsifiers are small predicates, not payloads",
+            raw.len()
+        );
+    }
     Ok(raw)
 }
 
@@ -467,11 +485,19 @@ fn parse_common(input: &Value) -> Result<(Vec<NostrEvent>, Policy, Ledger, Times
         .as_u64()
         .ok_or_else(|| anyhow!("now must be a unix timestamp"))?;
     // Verification is on unless explicitly disabled, and disabling it is for
-    // working with drafts that have not been signed yet.
+    // working with drafts that have not been signed yet. Turning it off takes
+    // the same deliberate act as the demo keys: an agent steered by a hostile
+    // claim should not be one flag away from resolving over forged events.
     let verify = input
         .get("verify_signatures")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    if !verify && std::env::var_os("CRUCIBLE_ALLOW_UNVERIFIED").is_none() {
+        bail!(
+            "verify_signatures:false resolves over events nobody checked; \
+             set CRUCIBLE_ALLOW_UNVERIFIED=1 to permit it"
+        );
+    }
     Ok((events, policy, ledger, now, verify))
 }
 
@@ -487,7 +513,8 @@ fn warnings(policy: &Policy, verify: bool) -> Vec<String> {
         out.push(
             "no roster configured: any key that can sign is counted as a witness, \
              so N fresh keypairs read as N independent agents. Populate \
-             policy.roster from your Buzz community's membership set."
+             policy.roster from your Buzz community's membership set; this ran \
+             only because allow_unrostered was set."
                 .into(),
         );
     }
@@ -537,6 +564,9 @@ pub fn resolve_verb(input: &Value) -> Result<Value> {
         "rejected_events": g.rejected,
         "verdict_event": verdict_event,
         "warnings": warnings(&policy, verify),
+        // Stamped so a downstream consumer cannot mistake an unchecked verdict
+        // for a checked one.
+        "signatures_verified": verify,
     }))
 }
 
@@ -564,10 +594,16 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
     });
 
     let mut verdicts = Vec::new();
+    let mut skipped = Vec::new();
     for id in claim_ids {
         let g = match gather(&events, Some(id), verify) {
             Ok(g) => g,
-            Err(_) => continue,
+            // Silence here means an operator running this on a timer watches a
+            // claim disappear from the ledger with no way to find out why.
+            Err(e) => {
+                skipped.push(json!({"claim": id.to_hex(), "reason": e.to_string()}));
+                continue;
+            }
         };
         let r = resolve(
             &g.claim,
@@ -583,6 +619,7 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
             &g.attestations,
             &g.challenges,
             &r.verdict,
+            &policy,
         );
         verdicts.push(json!({
             "claim": id.to_hex(),
@@ -617,6 +654,8 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
         "ledger": ledger,
         "calibration": report,
         "warnings": warnings(&policy, verify),
+        "signatures_verified": verify,
+        "skipped": skipped,
     }))
 }
 
@@ -857,6 +896,12 @@ mod tests {
         serde_json::from_str(MANIFEST).unwrap()
     }
 
+    /// Resolving with no roster is refused unless a policy says so out loud.
+    /// These tests are about other things, so they say so.
+    pub(super) fn open() -> Value {
+        json!({"allow_unrostered": true})
+    }
+
     pub(super) fn keys(seed: &str) -> (String, String) {
         sandbox();
         let k = keygen(&json!({ "seed": seed })).unwrap();
@@ -1015,12 +1060,15 @@ mod tests {
         events.extend(probes);
         let (_, resolver) = keys("resolver");
         let out = resolve_verb(&json!({
-            "events": events, "now": at + 60, "resolver": resolver,
+            "events": events, "now": at + 60, "resolver": resolver, "policy": open(),
         }))
         .unwrap();
 
         assert_eq!(out["resolution"]["verdict"]["status"], json!("supported"));
-        assert_eq!(out["resolution"]["verdict"]["n_eff"], json!(3.0));
+        // Three independent probes, a minute old against a fifteen-minute
+        // half-life: independence ages with the evidence carrying it.
+        let n_eff = out["resolution"]["verdict"]["n_eff"].as_f64().unwrap();
+        assert!((n_eff - 2.89).abs() < 0.01, "n_eff was {n_eff}");
         assert!(out["rejected_events"].as_array().unwrap().is_empty());
         // The verdict comes back ready to sign and publish back to the relay.
         assert_eq!(out["verdict_event"]["kind"], json!(kinds::VERDICT));
@@ -1040,12 +1088,14 @@ mod tests {
         let mut events = vec![claim.clone()];
         events.extend(probes);
 
-        let anonymous = resolve_verb(&json!({"events": events.clone(), "now": at + 60})).unwrap();
+        let anonymous =
+            resolve_verb(&json!({"events": events.clone(), "now": at + 60, "policy": open()}))
+                .unwrap();
         assert_eq!(anonymous["verdict_event"], Value::Null);
 
         let (_, resolver) = keys("auditor");
         let signed = resolve_verb(&json!({
-            "events": events, "now": at + 60, "resolver": resolver,
+            "events": events, "now": at + 60, "resolver": resolver, "policy": open(),
         }))
         .unwrap();
         // The id is over the resolver's pubkey, so it cannot match one derived
@@ -1093,7 +1143,7 @@ mod tests {
         forged["sig"] = json!("00".repeat(64));
 
         let out = resolve_verb(&json!({
-            "events": [claim, honest, forged.clone()], "now": at + 60,
+            "events": [claim, honest, forged.clone()], "now": at + 60, "policy": open(),
         }))
         .unwrap();
 
@@ -1112,17 +1162,21 @@ mod tests {
         let mut unsigned_claim = claim;
         unsigned_claim["sig"] = json!("00".repeat(64));
 
-        let err = resolve_verb(&json!({"events": [unsigned_claim.clone()], "now": at}))
-            .unwrap_err()
-            .to_string();
+        let err = resolve_verb(&json!({
+            "events": [unsigned_claim.clone()], "now": at, "policy": open(),
+        }))
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("no valid claim"), "got {err}");
         assert!(
             err.contains("failed verification"),
             "the error must say the claim was dropped, not that it was absent: {err}"
         );
 
+        std::env::set_var("CRUCIBLE_ALLOW_UNVERIFIED", "1");
         let ok = resolve_verb(&json!({
-            "events": [unsigned_claim], "now": at, "verify_signatures": false,
+            "events": [unsigned_claim], "now": at, "policy": open(),
+            "verify_signatures": false,
         }));
         assert!(
             ok.is_ok(),
@@ -1136,7 +1190,7 @@ mod tests {
         let (claim, _, _) = a_claim(at);
         let err = resolve_verb(&json!({
             "events": [claim], "now": at,
-            "policy": {"support_threshold": 0.1, "refute_threshold": 0.9},
+            "policy": {"support_threshold": 0.1, "refute_threshold": 0.9, "allow_unrostered": true},
         }))
         .unwrap_err()
         .to_string();
@@ -1154,7 +1208,8 @@ mod tests {
 
         let mut events = vec![claim];
         events.extend(probes);
-        let out = ledger_replay(&json!({"events": events, "now": at + 60})).unwrap();
+        let out =
+            ledger_replay(&json!({"events": events, "now": at + 60, "policy": open()})).unwrap();
 
         assert_eq!(out["verdicts"].as_array().unwrap().len(), 1);
         assert_eq!(out["verdicts"][0]["status"], json!("supported"));
@@ -1247,6 +1302,61 @@ mod hardening {
         assert!(err.contains("not a falsifier"), "got {err}");
     }
 
+    /// A missing roster now stops the run rather than merely annotating it. A
+    /// warning is only a mitigation for someone who reads it.
+    #[test]
+    fn resolving_without_a_roster_is_refused_not_merely_warned() {
+        let at = 1_700_000_000;
+        let (claim, _, _) = a_claim(at);
+        let err = resolve_verb(&json!({"events": [claim.clone()], "now": at}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("roster"), "got {err}");
+        assert!(
+            err.contains("allow_unrostered"),
+            "must say how to proceed: {err}"
+        );
+
+        assert!(resolve_verb(&json!({
+            "events": [claim], "now": at, "policy": open(),
+        }))
+        .is_ok());
+    }
+
+    /// Falsifiers are small predicates. A hostile claim must not be able to
+    /// make a prober parse a payload.
+    #[test]
+    fn an_oversized_falsifier_is_refused() {
+        let huge = hex::encode(vec![0u8; MAX_MODULE_BYTES + 1]);
+        let err = probe_run(&json!({"manifest": manifest(), "module_hex": huge}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("limit"), "got {err}");
+    }
+
+    /// An operator running replay on a timer needs to see why a claim vanished
+    /// from the ledger, not just that it did.
+    #[test]
+    fn replay_reports_the_claims_it_skipped() {
+        let at = 1_700_000_000;
+        let (claim, _, _) = a_claim(at);
+        let mut forged = claim;
+        forged["sig"] = json!("00".repeat(64));
+
+        let out = ledger_replay(&json!({
+            "events": [forged.clone()], "now": at, "policy": open(),
+        }))
+        .unwrap();
+        assert!(out["verdicts"].as_array().unwrap().is_empty());
+        let skipped = out["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["claim"], forged["id"]);
+        assert!(skipped[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("failed verification"));
+    }
+
     #[test]
     fn a_falsifier_inside_the_store_still_loads() {
         let out = probe_run(&json!({
@@ -1263,7 +1373,8 @@ mod hardening {
     fn a_missing_roster_is_warned_about_in_band() {
         let at = 1_700_000_000;
         let (claim, _, _) = a_claim(at);
-        let out = resolve_verb(&json!({"events": [claim.clone()], "now": at})).unwrap();
+        let out =
+            resolve_verb(&json!({"events": [claim.clone()], "now": at, "policy": open()})).unwrap();
         let warnings = out["warnings"].as_array().unwrap();
         assert!(
             warnings
@@ -1285,10 +1396,12 @@ mod hardening {
     fn disabling_signature_checks_is_warned_about() {
         let at = 1_700_000_000;
         let (claim, _, _) = a_claim(at);
+        std::env::set_var("CRUCIBLE_ALLOW_UNVERIFIED", "1");
         let out = resolve_verb(&json!({
-            "events": [claim], "now": at, "verify_signatures": false,
+            "events": [claim], "now": at, "policy": open(), "verify_signatures": false,
         }))
         .unwrap();
+        assert_eq!(out["signatures_verified"], json!(false));
         assert!(out["warnings"]
             .as_array()
             .unwrap()

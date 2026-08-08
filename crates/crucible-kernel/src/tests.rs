@@ -129,13 +129,22 @@ fn proven(ledger: &mut Ledger, agent: u8, domain: &str) {
     }
 }
 
+/// The defaults, with the roster requirement waived. Scenario tests are about
+/// the kernel's arithmetic, not about admission control, which has its own.
+fn open_policy() -> Policy {
+    Policy {
+        allow_unrostered: true,
+        ..Policy::default()
+    }
+}
+
 fn resolve_at(
     claim: &Claim,
     probes: &[Attestation],
     ledger: &Ledger,
     now: u64,
 ) -> crate::resolve::Resolution {
-    resolve(claim, probes, &[], ledger, &Policy::default(), now)
+    resolve(claim, probes, &[], ledger, &open_policy(), now)
 }
 
 // ---------------------------------------------------------------- independence
@@ -213,7 +222,11 @@ fn one_agent_attesting_many_times_counts_once() {
 
     let r = resolve_at(&claim, &probes, &Ledger::new(), T0 + 100);
     assert_eq!(r.verdict.attestations, 1, "only the latest position counts");
-    assert_eq!(r.verdict.n_eff, 1.0);
+    assert!(
+        (r.verdict.n_eff - 0.94).abs() < 0.01,
+        "one witness, slightly aged: {}",
+        r.verdict.n_eff
+    );
     assert_eq!(r.verdict.status, Status::Insufficient);
 }
 
@@ -735,7 +748,17 @@ fn a_stricter_policy_demands_more_witnesses() {
             .status,
         Status::Supported
     );
-    let strict = resolve(&claim, &probes, &[], &Ledger::new(), &Policy::strict(), T0);
+    let strict = resolve(
+        &claim,
+        &probes,
+        &[],
+        &Ledger::new(),
+        &Policy {
+            allow_unrostered: true,
+            ..Policy::strict()
+        },
+        T0,
+    );
     assert_eq!(strict.verdict.status, Status::Insufficient);
 }
 
@@ -765,7 +788,14 @@ fn settling_rewards_the_correct_and_penalises_the_wrong() {
     let r = resolve_at(&claim, &probes, &ledger, T0);
     assert_eq!(r.verdict.status, Status::Supported);
 
-    assert!(settle(&mut ledger, &claim, &probes, &[], &r.verdict));
+    assert!(settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        &[],
+        &r.verdict,
+        &open_policy()
+    ));
 
     assert!(ledger.get(&key(1), "ci").r() > crate::calibration::BOOTSTRAP);
     assert!(ledger.get(&key(6), "ci").r() < crate::calibration::BOOTSTRAP);
@@ -785,7 +815,14 @@ fn an_unresolved_claim_settles_nothing() {
     let r = resolve_at(&claim, &probes, &ledger, T0);
     assert_eq!(r.verdict.status, Status::Insufficient);
 
-    assert!(!settle(&mut ledger, &claim, &probes, &[], &r.verdict));
+    assert!(!settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        &[],
+        &r.verdict,
+        &open_policy()
+    ));
     assert!(ledger.is_empty());
 }
 
@@ -801,7 +838,14 @@ fn an_indeterminate_probe_is_not_scored() {
 
     let mut ledger = Ledger::new();
     let r = resolve_at(&claim, &probes, &ledger, T0);
-    settle(&mut ledger, &claim, &probes, &[], &r.verdict);
+    settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        &[],
+        &r.verdict,
+        &open_policy(),
+    );
 
     assert_eq!(
         ledger.get(&key(5), "ci").r(),
@@ -837,6 +881,7 @@ fn a_correct_challenger_gains_and_a_wrong_one_loses() {
         &probes,
         std::slice::from_ref(&challenge),
         &r.verdict,
+        &open_policy(),
     );
     assert!(
         ledger.get(&key(90), "ci").r() < crate::calibration::BOOTSTRAP,
@@ -850,7 +895,14 @@ fn a_correct_challenger_gains_and_a_wrong_one_loses() {
     let mut ledger2 = Ledger::new();
     let r2 = resolve_at(&claim, &refuting, &ledger2, T0);
     assert_eq!(r2.verdict.status, Status::Refuted);
-    settle(&mut ledger2, &claim, &refuting, &[challenge], &r2.verdict);
+    settle(
+        &mut ledger2,
+        &claim,
+        &refuting,
+        &[challenge],
+        &r2.verdict,
+        &open_policy(),
+    );
     assert!(ledger2.get(&key(90), "ci").r() > crate::calibration::BOOTSTRAP);
 }
 
@@ -880,7 +932,7 @@ fn a_challenge_does_not_move_belief_by_itself() {
         &probes,
         &challenges,
         &Ledger::new(),
-        &Policy::default(),
+        &open_policy(),
         T0,
     );
 
@@ -903,7 +955,14 @@ fn reliability_earned_in_one_round_carries_into_the_next() {
 
     for _ in 0..30 {
         let r = resolve_at(&claim, &probes, &ledger, T0);
-        settle(&mut ledger, &claim, &probes, &[], &r.verdict);
+        settle(
+            &mut ledger,
+            &claim,
+            &probes,
+            &[],
+            &r.verdict,
+            &open_policy(),
+        );
     }
 
     let after = resolve_at(&claim, &probes[..1], &ledger, T0).verdict.mass;
@@ -927,12 +986,26 @@ fn a_claim_settles_exactly_once_however_often_it_is_replayed() {
     let mut ledger = Ledger::new();
     let r = resolve_at(&claim, &probes, &ledger, T0);
 
-    assert!(settle(&mut ledger, &claim, &probes, &[], &r.verdict));
+    assert!(settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        &[],
+        &r.verdict,
+        &open_policy()
+    ));
     let once = ledger.get(&key(1), "ci").r();
 
     for _ in 0..50 {
         assert!(
-            !settle(&mut ledger, &claim, &probes, &[], &r.verdict),
+            !settle(
+                &mut ledger,
+                &claim,
+                &probes,
+                &[],
+                &r.verdict,
+                &open_policy()
+            ),
             "a replayed settlement must be refused"
         );
     }
@@ -958,7 +1031,7 @@ fn attestors_outside_the_roster_are_excluded_with_a_reason() {
     // With one, only the admitted members are heard.
     let policy = Policy {
         roster: Some([key(200), key(1), key(2)].into_iter().collect()),
-        ..Policy::default()
+        ..open_policy()
     };
     let closed = resolve(&claim, &sybils, &[], &Ledger::new(), &policy, T0);
     assert_eq!(closed.verdict.attestations, 2);
@@ -977,7 +1050,7 @@ fn an_unadmitted_author_carries_no_weight_of_its_own() {
 
     let policy = Policy {
         roster: Some([key(1)].into_iter().collect()),
-        ..Policy::default()
+        ..open_policy()
     };
     let r = resolve(&claim, &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.mass, 0.5);
@@ -1000,7 +1073,7 @@ fn a_domain_the_community_does_not_recognise_earns_the_author_nothing() {
                 .into_iter()
                 .collect(),
         ),
-        ..Policy::default()
+        ..open_policy()
     };
     let r = resolve(&claim, &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.support, 0.0);
@@ -1023,7 +1096,7 @@ fn attestations_beyond_the_cap_are_dropped_oldest_first() {
 
     let policy = Policy {
         max_attestations: 10,
-        ..Policy::default()
+        ..open_policy()
     };
     let r = resolve(&claim, &flood, &[], &Ledger::new(), &policy, T0 + 500);
     assert!(r.verdict.attestations <= 10);
@@ -1061,4 +1134,199 @@ fn a_free_abstention_cannot_suppress_an_honest_fleet() {
         (after - clean).abs() < 1e-12,
         "an abstention wearing the fleet's provenance changed n_eff {clean} -> {after}"
     );
+}
+
+// ------------------------------------------------ third-pass audit regressions
+
+/// A claim dated into the future computes its own age as zero, so its author's
+/// assertion never decays — and that assertion alone keeps total evidence above
+/// the decay floor, so the claim can never go stale either. One integer used to
+/// buy a belief that outlived every piece of evidence in it: the identical
+/// honestly-dated claim read `Decayed` at 0.5 while the future-dated one read
+/// `Supported` at 0.99.
+#[test]
+fn a_future_dated_claim_is_not_in_effect() {
+    let mut ledger = Ledger::new();
+    proven(&mut ledger, 200, "ci");
+    let now = T0 + HALF_LIFE * 3000;
+
+    let mut zombie = claim_with(0.99);
+    zombie.created_at = now + 10 * HALF_LIFE;
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&zombie))
+        .collect();
+
+    let r = resolve_at(&zombie, &probes, &ledger, now);
+    assert_eq!(r.verdict.status, Status::Insufficient);
+    assert_eq!(
+        r.verdict.support, 0.0,
+        "a claim from the future carries no weight"
+    );
+    assert!(r
+        .excluded
+        .iter()
+        .any(|e| e.source == zombie.id && e.reason.contains("clock-skew")));
+
+    // The honestly-dated twin, for contrast: this is what staleness looks like.
+    let honest = claim_with(0.99);
+    let hp: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&honest))
+        .collect();
+    assert_eq!(
+        resolve_at(&honest, &hp, &ledger, now).verdict.status,
+        Status::Decayed
+    );
+}
+
+/// Independence has to age with the evidence carrying it, or a probe from years
+/// ago still clears `min_n_eff` today and the room keeps passing its own
+/// freshness bar on witnesses that no longer say anything about the present.
+#[test]
+fn independence_ages_with_its_evidence() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=6)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+
+    assert!(
+        (resolve_at(&claim, &probes, &Ledger::new(), T0)
+            .verdict
+            .n_eff
+            - 6.0)
+            .abs()
+            < 1e-9
+    );
+
+    let mut previous = 6.0;
+    for k in 1..8 {
+        let n = resolve_at(&claim, &probes, &Ledger::new(), T0 + HALF_LIFE * k)
+            .verdict
+            .n_eff;
+        assert!(n < previous, "n_eff must fall with age: {previous} -> {n}");
+        previous = n;
+    }
+    assert!(
+        previous < 0.1,
+        "stale witnesses stop counting, got {previous}"
+    );
+}
+
+/// A half-life of a century decays imperceptibly, so the claim never reaches
+/// the decay floor and never has to be re-checked — immortality without needing
+/// to lie about the date.
+#[test]
+fn an_absurd_half_life_is_clamped_and_reported() {
+    let mut forever = claim_with(0.99);
+    forever.half_life = u64::MAX / 2;
+    let mut ledger = Ledger::new();
+    proven(&mut ledger, 200, "ci");
+    let probes: Vec<_> = (1..=3)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&forever))
+        .collect();
+
+    let policy = open_policy();
+    let far = T0 + policy.max_half_life * 60;
+    let r = resolve(&forever, &probes, &[], &ledger, &policy, far);
+
+    assert_eq!(r.verdict.status, Status::Decayed);
+    assert!(
+        r.excluded.iter().any(|e| e.reason.contains("clamped")),
+        "the clamp must be visible"
+    );
+}
+
+/// The verdict and the ledger have to be computed over the same evidence.
+/// They were not: the roster and clock-skew filters lived inside `resolve`, so
+/// an unadmitted key farmed reputation for attestations the room had explicitly
+/// refused — and cashed it in the moment it was admitted.
+#[test]
+fn settlement_scores_only_what_the_verdict_counted() {
+    let claim = a_claim();
+    let mut probes: Vec<_> = (1..=4)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+
+    // An outsider, and a future-dated self-attestation by the claimant.
+    probes.push(ProbeSpec::independent(9, Outcome::Holds).build(&claim));
+    let mut ahead = ProbeSpec::independent(10, Outcome::Holds).build(&claim);
+    ahead.attestor = claim.author;
+    ahead.created_at = T0 + 100 * HALF_LIFE;
+    probes.push(ahead);
+
+    let policy = Policy {
+        roster: (1..=4)
+            .map(key)
+            .chain([key(200)])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into(),
+        ..Policy::default()
+    };
+    let mut ledger = Ledger::new();
+    let r = resolve(&claim, &probes, &[], &ledger, &policy, T0 + 60);
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert_eq!(r.verdict.attestations, 4);
+    assert_eq!(r.excluded.len(), 2);
+
+    assert!(settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        &[],
+        &r.verdict,
+        &policy
+    ));
+
+    assert_eq!(
+        ledger.get(&key(9), "ci").evidence(),
+        0.0,
+        "an unadmitted key must not build a record on evidence the room refused"
+    );
+    // The author is scored for its claim, and for nothing else.
+    let author = ledger.get(&key(200), "ci");
+    assert!(
+        (author.evidence() - 0.6).abs() < 1e-9,
+        "the claimant inflated its own record with a future-dated self-attestation: {}",
+        author.evidence()
+    );
+    for n in 1..=4 {
+        assert!(ledger.get(&key(n), "ci").evidence() > 0.0);
+    }
+}
+
+/// A challenge from a key nobody admitted settles against nobody.
+#[test]
+fn an_unadmitted_challenger_is_not_scored() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=4)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let challenge = Challenge {
+        id: id(90),
+        challenger: key(90),
+        created_at: T0,
+        claim: claim.id,
+        stake: 0.8,
+        counter_falsifier: None,
+        reason: "no".into(),
+    };
+    let policy = Policy {
+        roster: (1..=4)
+            .map(key)
+            .chain([key(200)])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into(),
+        ..Policy::default()
+    };
+
+    let mut ledger = Ledger::new();
+    let r = resolve(&claim, &probes, &[], &ledger, &policy, T0);
+    settle(
+        &mut ledger,
+        &claim,
+        &probes,
+        std::slice::from_ref(&challenge),
+        &r.verdict,
+        &policy,
+    );
+    assert_eq!(ledger.get(&key(90), "ci").evidence(), 0.0);
 }

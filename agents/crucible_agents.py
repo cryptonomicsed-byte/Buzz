@@ -49,6 +49,10 @@ ENV = {
     "CRUCIBLE_ALLOW_DEMO_KEYS": "1",
 }
 
+# Resolving with no roster is refused unless a policy says so out loud. These
+# scripts are demonstrations, not deployments, so they say so.
+OPEN = {"allow_unrostered": True}
+
 
 def crucible(verb: str, payload: dict | None = None) -> dict:
     proc = subprocess.run(
@@ -198,6 +202,7 @@ class Auditor:
     def audit(self, now: int) -> list[dict]:
         replay = crucible("ledger.replay", {
             "events": self.relay.events, "now": now, "ledger": self.ledger,
+            "policy": OPEN,
         })
         self.ledger = replay["ledger"]
         self.p.remember("ledger", replay["ledger"])
@@ -205,7 +210,7 @@ class Auditor:
         for v in replay["verdicts"]:
             resolved = crucible("resolve", {
                 "events": self.relay.events, "claim": v["claim"], "now": now,
-                "resolver": self.p.pubkey,
+                "resolver": self.p.pubkey, "policy": OPEN,
             })
             if resolved["verdict_event"]:
                 self.relay.publish(self.p.sign(resolved["verdict_event"]))

@@ -93,6 +93,8 @@ rewarding predictable wrongness would invite an adversary to be wrong on purpose
 Every claim has a half-life. "`main` is green" is worth half as much fifteen
 minutes later; "the licence is Apache-2.0" decays over months. A claim nobody
 re-checks becomes `Decayed`, not `Supported`. Silence is not corroboration.
+Independence perishes with it: `n_eff` counts witnesses *weighted by how fresh
+their evidence is*, so a probe from last year no longer clears the bar today.
 
 **4. Not knowing and disagreeing are different things.**
 Both sit near probability one-half, and collapsing them is how a room mistakes
@@ -118,7 +120,7 @@ docs/BUZZ.md             how this attaches to a Buzz deployment
 ## Try it
 
 ```bash
-cargo test                      # 172 tests
+cargo test                      # 181 tests
 cargo build -p crucible-cli
 python3 examples/demo.py        # the walkthrough above
 
@@ -127,9 +129,11 @@ crucible tools                  # every verb, machine-readable
 echo '{"observations":["ci:status"]}' | crucible manifest.digest
 ```
 
-`module_path` reads only from the falsifier store, and `keygen`/`event.sign`
-need `CRUCIBLE_ALLOW_DEMO_KEYS=1`. Both gates exist because these verbs are
-reachable over MCP by an agent that reads messages from strangers.
+Three gates, all because these verbs are reachable over MCP by an agent that
+reads messages from strangers: `module_path` reads only from the falsifier
+store; `keygen`/`event.sign` need `CRUCIBLE_ALLOW_DEMO_KEYS=1`; and resolving
+with no roster is **refused** unless the policy says `allow_unrostered: true`.
+A warning is only a mitigation for somebody who reads it.
 
 Watch three agents work a claim with no coordinator between them:
 
@@ -194,6 +198,17 @@ concurrently under a per-request timeout instead of blocking on one expensive
 falsifier; `falsifier.announce` (kind 47007) is now actually emitted, so a
 prober can read a module's blast radius before running it; and the deterministic
 key verbs are gated behind an explicit opt-in.
+
+A third and fourth pass then found two more, both in the accounting core and
+both fixed. A claim dated into the future computed its own age as zero, so its
+author's assertion never decayed and kept total evidence above the decay floor
+forever: the identical honestly-dated claim read `Decayed` at 0.5 while the
+future-dated one read `Supported` at 0.99. The horizon that already guarded
+attestations now guards claims, `n_eff` ages with its evidence, and an absurd
+half-life is clamped — three roads to the same immortal belief, closed. And
+`settle` was scoring evidence `resolve` had explicitly excluded, so a key
+nobody admitted could build a reputation on attestations the room refused and
+cash it in on admission; both now compute over one shared admission filter.
 
 What follows is what remains true.
 

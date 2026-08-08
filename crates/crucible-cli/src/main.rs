@@ -12,9 +12,14 @@
 
 mod verbs;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
+
+/// Ceiling on a single request. Generous for a real log — a community's whole
+/// 47000-block history is far smaller — and finite, which unbounded input is
+/// not. These verbs are driven by an agent reading messages from strangers.
+const MAX_REQUEST_BYTES: u64 = 16 << 20;
 
 fn main() {
     let code = match run() {
@@ -51,9 +56,13 @@ fn run() -> Result<()> {
         json!({})
     } else {
         let mut raw = String::new();
-        std::io::stdin()
+        let read = std::io::stdin()
+            .take(MAX_REQUEST_BYTES + 1)
             .read_to_string(&mut raw)
             .context("reading JSON request from stdin")?;
+        if read as u64 > MAX_REQUEST_BYTES {
+            bail!("request exceeds the {MAX_REQUEST_BYTES}-byte limit");
+        }
         if raw.trim().is_empty() {
             json!({})
         } else {

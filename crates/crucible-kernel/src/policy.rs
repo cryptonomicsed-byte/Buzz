@@ -62,6 +62,23 @@ pub struct Policy {
     /// a relay, so it needs a ceiling that is not "however many arrived".
     pub max_attestations: usize,
 
+    /// Longest half-life a claim may declare, in seconds.
+    ///
+    /// A second road to an immortal belief, and it needs no future dating: a
+    /// claim with a half-life of a century decays imperceptibly, so it never
+    /// reaches the decay floor and never has to be re-checked. Ninety days is
+    /// already far longer than anything a room should hold without looking
+    /// again; longer half-lives are clamped to this and the clamp is reported.
+    pub max_half_life: Timestamp,
+
+    /// Permit resolving with no roster at all.
+    ///
+    /// Off by default, because a missing roster is the difference between a
+    /// demo and a deployment and it fails silently: every key that can sign is
+    /// counted as a witness, so three fresh keypairs reach `Supported` in about
+    /// a second. Running without one has to be a thing somebody chose.
+    pub allow_unrostered: bool,
+
     /// Calibration domains this community recognises.
     ///
     /// The domain is chosen by the claim's *author*, and reliability is keyed on
@@ -92,6 +109,8 @@ impl Default for Policy {
             // a server, sluggish on a phone. Five hundred is still far more
             // independent witnesses than any real claim attracts.
             max_attestations: 512,
+            max_half_life: 90 * 86_400,
+            allow_unrostered: false,
             domains: None,
         }
     }
@@ -147,6 +166,16 @@ impl Policy {
         if self.roster.as_ref().is_some_and(BTreeSet::is_empty) {
             return Err("an empty roster admits nobody; omit it to admit anyone");
         }
+        if self.roster.is_none() && !self.allow_unrostered {
+            return Err(
+                "no roster: every key that can sign would count as a witness. \
+                 Set `roster` to this community's membership set, or \
+                 `allow_unrostered: true` if that is genuinely what you want",
+            );
+        }
+        if self.max_half_life == 0 {
+            return Err("max_half_life of zero would decay every claim instantly");
+        }
         Ok(())
     }
 }
@@ -155,20 +184,51 @@ impl Policy {
 mod tests {
     use super::*;
 
+    /// A policy for tests and demos: the defaults, with the roster requirement
+    /// explicitly waived.
+    fn open() -> Policy {
+        Policy {
+            allow_unrostered: true,
+            ..Policy::default()
+        }
+    }
+
+    /// The default policy must *not* validate. A missing roster is silent and
+    /// fatal, so refusing to start is the only mitigation that cannot be
+    /// scrolled past.
     #[test]
-    fn defaults_and_strict_are_valid() {
-        Policy::default().validate().unwrap();
-        Policy::strict().validate().unwrap();
+    fn the_default_policy_refuses_to_run_without_a_roster() {
+        let err = Policy::default().validate().unwrap_err();
+        assert!(err.contains("roster"), "got {err}");
+
+        open().validate().unwrap();
+        Policy {
+            roster: Some([PubKey::from_bytes([1; 32])].into_iter().collect()),
+            ..Policy::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn strict_is_valid_once_rostered() {
+        Policy {
+            allow_unrostered: true,
+            ..Policy::strict()
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]
     fn an_empty_roster_admits_nobody_and_is_refused() {
-        let mut p = Policy::default();
         assert!(
-            p.admits(&PubKey::from_bytes([1; 32])),
-            "no roster admits anyone"
+            Policy::default().admits(&PubKey::from_bytes([1; 32])),
+            "with no roster, admission is unconditional — which is exactly why \
+             validate() refuses to run that way"
         );
 
+        let mut p = open();
         p.roster = Some(BTreeSet::new());
         assert!(
             p.validate().is_err(),
@@ -183,7 +243,7 @@ mod tests {
 
     #[test]
     fn domains_can_be_restricted_to_a_known_set() {
-        let mut p = Policy::default();
+        let mut p = open();
         assert!(p.recognises("anything-at-all"));
         p.domains = Some(
             ["ci".to_string(), "security".to_string()]
@@ -222,27 +282,31 @@ mod tests {
             Policy {
                 support_threshold: 0.1,
                 refute_threshold: 0.9,
-                ..Default::default()
+                ..open()
             },
             Policy {
                 min_n_eff: 0.0,
-                ..Default::default()
+                ..open()
             },
             Policy {
                 support_threshold: 1.5,
-                ..Default::default()
+                ..open()
             },
             Policy {
                 conflict_ratio: 2.0,
-                ..Default::default()
+                ..open()
             },
             Policy {
                 decay_floor: -1.0,
-                ..Default::default()
+                ..open()
             },
             Policy {
                 max_attestations: 0,
-                ..Default::default()
+                ..open()
+            },
+            Policy {
+                max_half_life: 0,
+                ..open()
             },
         ];
         for p in cases {
@@ -253,7 +317,8 @@ mod tests {
     #[test]
     fn round_trips_through_json_with_partial_config() {
         // A community should be able to override one knob without restating all.
-        let p: Policy = serde_json::from_str(r#"{"min_n_eff":3.0}"#).unwrap();
+        let p: Policy =
+            serde_json::from_str(r#"{"min_n_eff":3.0,"allow_unrostered":true}"#).unwrap();
         assert_eq!(p.min_n_eff, 3.0);
         assert_eq!(p.support_threshold, Policy::default().support_threshold);
         p.validate().unwrap();

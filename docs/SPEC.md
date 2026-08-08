@@ -57,7 +57,7 @@ The proposition, and the executable that would refute it.
 | `c` | 1 | Buzz community/channel. Belief is scoped to a room |
 | `domain` | 1 | Calibration bucket: `ci`, `security`, `perf`, … |
 | `conf` | 1 | Author's probability, `0 < p < 1` |
-| `halflife` | 1 | Seconds after which evidence is worth half as much |
+| `halflife` | 1 | Seconds after which evidence is worth half as much; clamped to the community's `max_half_life` |
 | `expiry` | 0–1 | Unix time after which the claim is `Decayed` regardless |
 | `falsifier` | 1 | `["falsifier", <module-sha256>, "wasm", <manifest-sha256>, <purity>]` |
 | `lineage` | 0–1 | Author's model lineage; defaults to `key:<pubkey>` |
@@ -115,7 +115,8 @@ Somebody ran the falsifier and signed what happened.
 Content is the falsifier's explanation.
 
 An attestation dated more than `max_clock_skew` seconds ahead of the resolver's
-`now` is refused. Age drives decay and `created_at` is self-declared, so without
+`now` is refused, and so is a **claim** dated that far ahead — a claim from the
+future is not yet in effect, carries no author weight, and cannot resolve. Age drives decay and `created_at` is self-declared, so without
 that bound a probe dated to the year 2100 would never age at all — a claim with
 a fifteen-minute half-life, permanently fresh, from one integer.
 
@@ -153,7 +154,7 @@ challenge costs exactly what a bold wrong claim does.
 | `e` | `[<claim-id>, "", "claim"]` |
 | `status` | `supported` \| `refuted` \| `contested` \| `insufficient` \| `decayed` \| `nondeterministic` |
 | `mass` | Posterior probability the claim is true |
-| `neff` | Effective independent witnesses |
+| `neff` | Effective independent witnesses, weighted by the freshness of their evidence |
 | `support` / `opposition` | Decayed, discounted log-odds each way |
 | `n` | Attestations considered |
 
@@ -181,7 +182,9 @@ In order, first match wins:
    any pure claim permanently, for free.
 2. **`decayed`** — past `expiry`, or evidence once existed and has aged below
    the floor.
-3. **`insufficient`** — fewer than `min_n_eff` independent probes.
+3. **`insufficient`** — fewer than `min_n_eff` independent probes, where
+   independence is weighted by decay. An unaged count would let a probe from
+   years ago clear today's freshness bar.
 4. **`contested`** — both sides carry real, comparable weight *among probes*.
    The author's own forecast is excluded here: letting it count as one side
    would let a claimant manufacture a controversy by asserting against the

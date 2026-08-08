@@ -42,6 +42,10 @@ ENV = {
     "CRUCIBLE_ALLOW_DEMO_KEYS": "1",
 }
 
+# Resolving with no roster is refused unless a policy says so out loud. These
+# scripts are demonstrations, not deployments, so they say so.
+OPEN = {"allow_unrostered": True}
+
 
 def crucible(verb, payload=None):
     """Call one CLI verb. JSON in, JSON out, no hidden state."""
@@ -151,7 +155,7 @@ def main():
         for i in range(1, 4)
     ]
     show("unanimous, and worth almost nothing:", crucible("resolve", {
-        "events": [claim_event] + echo_chamber, "now": T0 + 60,
+        "events": [claim_event] + echo_chamber, "now": T0 + 60, "policy": OPEN,
     }))
     print("    -> three voices, barely one witness. A vote would have said 3/3.")
 
@@ -168,7 +172,7 @@ def main():
         for i, name in enumerate(["goose-gpt", "codex", "claude-opus-5"], start=1)
     ]
     show("checked, and believed:", crucible("resolve", {
-        "events": [claim_event] + independent, "now": T0 + 60,
+        "events": [claim_event] + independent, "now": T0 + 60, "policy": OPEN,
     }))
 
     # ---------------------------------------------------------------- scene 3
@@ -183,7 +187,7 @@ def main():
     print(f"    its probe said: {dissent_run['outcome']} — \"{dissent_run['explanation']}\"")
 
     lone = show("one unproven voice does not stop the room:", crucible("resolve", {
-        "events": [claim_event] + independent + [dissent], "now": T0 + 120,
+        "events": [claim_event] + independent + [dissent], "now": T0 + 120, "policy": OPEN,
     }))
     assert lone["status"] != "contested"
     print("    -> `contested` has no arbitration and costs its trigger nothing,")
@@ -194,7 +198,7 @@ def main():
         ci_status="red", lineage="another-model", env="another-host",
         blind=True, at=T0 + 100)
     contested = show("two independent dissenters are a controversy:", crucible("resolve", {
-        "events": [claim_event] + independent + [dissent, second], "now": T0 + 120,
+        "events": [claim_event] + independent + [dissent, second], "now": T0 + 120, "policy": OPEN,
     }))
     assert contested["status"] == "contested"
     print("    -> the room is told there is an argument, not handed a shrug.")
@@ -206,6 +210,7 @@ def main():
     for elapsed in (0, HALF_LIFE * 3, HALF_LIFE * 30):
         v = crucible("resolve", {
             "events": [claim_event] + independent, "now": T0 + 60 + elapsed,
+            "policy": OPEN,
         })["resolution"]["verdict"]
         print(f"    +{elapsed // 60:>4} min   {v['status']:<13} mass {v['mass']:.3f}")
     print("    -> beliefs here expire. Silence is not corroboration.")
@@ -215,7 +220,7 @@ def main():
     print("SCENE 5  The log is replayed and the ledger falls out of it.")
 
     replay = crucible("ledger.replay", {
-        "events": [claim_event] + independent, "now": T0 + 60,
+        "events": [claim_event] + independent, "now": T0 + 60, "policy": OPEN,
     })
     for row in replay["calibration"]:
         brier = f"{row['brier']:.3f}" if row["brier"] is not None else "  -  "
@@ -237,7 +242,7 @@ def main():
         for i in range(1, 4)
     ]
     open_room = crucible("resolve", {
-        "events": [claim_event] + sybils, "now": T0 + 60,
+        "events": [claim_event] + sybils, "now": T0 + 60, "policy": OPEN,
     })["resolution"]["verdict"]
     print(f"    with no roster:  {open_room['status'].upper()}"
           f"  n_eff {open_room['n_eff']:.2f}  <- three keypairs, one second")

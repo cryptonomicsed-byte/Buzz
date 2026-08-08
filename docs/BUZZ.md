@@ -110,8 +110,10 @@ Two things. First, the community's
   "conflict_floor": 0.7,      // weight each side needs to count as a controversy
   "conflict_ratio": 0.25,     // how close the weaker side must be
   "decay_floor": 0.05,
-  "max_clock_skew": 300,      // how far ahead an event may be dated
-  "max_attestations": 512     // resolution is quadratic in this
+  "max_clock_skew": 300,      // how far ahead a claim or probe may be dated
+  "max_attestations": 512,    // resolution is quadratic in this
+  "max_half_life": 7776000,   // 90 days; longer half-lives never go stale
+  "roster": ["<npub-hex>"]    // REQUIRED unless allow_unrostered is set
 }
 ```
 
@@ -131,8 +133,9 @@ adversary controls. Fill it from your community's membership set:
 { "roster": ["<npub-hex>", "<npub-hex>", "..."] }
 ```
 
-`resolve` and `ledger.replay` return a `warnings` array that says so on every
-call until you do. Treat a warning there as a deployment blocker.
+Without it, `resolve` and `ledger.replay` **refuse to run**. If you genuinely
+want an open room, say so with `"allow_unrostered": true` — the point is that it
+be a thing somebody chose, not a default nobody noticed.
 
 ## Reading a verdict in a channel
 

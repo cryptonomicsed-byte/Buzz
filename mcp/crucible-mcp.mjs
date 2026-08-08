@@ -31,6 +31,29 @@ const PROTOCOL_VERSION = "2025-06-18";
 // expensive claim occupies the server for as long as it likes.
 const CALL_TIMEOUT_MS = Number(process.env.CRUCIBLE_TIMEOUT_MS ?? 20_000);
 
+// Dispatching concurrently fixed head-of-line blocking, but sequential handling
+// had been an accidental rate limit — N concurrent calls became N concurrent
+// processes, each free to burn its fuel budget. A small permit pool keeps the
+// fix without turning a probe flood into a fork bomb on the agent's machine.
+const MAX_CONCURRENT = Math.max(1, Number(process.env.CRUCIBLE_MAX_CONCURRENT ?? 4));
+
+const permits = {
+  free: MAX_CONCURRENT,
+  waiting: [],
+  acquire() {
+    if (this.free > 0) {
+      this.free -= 1;
+      return Promise.resolve();
+    }
+    return new Promise((release) => this.waiting.push(release));
+  },
+  release() {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.free += 1;
+  },
+};
+
 function findBinary() {
   const explicit = process.env.CRUCIBLE_BIN;
   if (explicit) return explicit;
@@ -161,7 +184,13 @@ const handlers = {
       const known = TOOLS.map((t) => t.name).join(", ");
       throw new Error(`unknown tool \`${name}\`; available: ${known}`);
     }
-    const result = await callCrucible(tool._verb, args ?? {});
+    await permits.acquire();
+    let result;
+    try {
+      result = await callCrucible(tool._verb, args ?? {});
+    } finally {
+      permits.release();
+    }
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       structuredContent: result,
