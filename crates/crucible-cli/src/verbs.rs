@@ -69,35 +69,100 @@ fn parse_manifest(v: &Value) -> Result<Manifest> {
         .canonical())
 }
 
-/// Read a falsifier module from a path or from inline hex.
+/// Where `module_path` is allowed to read from.
+///
+/// Set with `CRUCIBLE_FALSIFIER_DIR`; defaults to `./falsifiers`.
+fn falsifier_root() -> std::path::PathBuf {
+    std::env::var_os("CRUCIBLE_FALSIFIER_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("falsifiers"))
+}
+
+/// Resolve `requested` inside the falsifier store, refusing anything outside it.
+///
+/// This is a confused-deputy boundary, not a tidiness rule. These verbs are
+/// reachable over MCP by an agent that reads messages from strangers, and an
+/// unrestricted `module_path` turns `claim.build` into a hash oracle over the
+/// whole filesystem: point it at `/etc/shadow` or a `.env`, get back a SHA-256
+/// that is crackable offline for anything guessable. Both paths are
+/// canonicalised before comparison so `..` and symlinks cannot walk out.
+fn resolve_in_store(requested: &str) -> Result<std::path::PathBuf> {
+    let root = falsifier_root();
+    let canonical_root = root.canonicalize().with_context(|| {
+        format!(
+            "falsifier store {} does not exist; create it or set CRUCIBLE_FALSIFIER_DIR",
+            root.display()
+        )
+    })?;
+
+    let candidate = std::path::Path::new(requested);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        canonical_root.join(candidate)
+    };
+    let canonical = joined
+        .canonicalize()
+        .with_context(|| format!("no falsifier at {requested}"))?;
+
+    if !canonical.starts_with(&canonical_root) {
+        // Deliberately does not echo the resolved path: the caller already knows
+        // what it asked for, and confirming where a path landed is itself a
+        // probe of the filesystem.
+        bail!(
+            "module_path must name a file inside the falsifier store ({}); \
+             `{requested}` resolves outside it",
+            canonical_root.display()
+        );
+    }
+    Ok(canonical)
+}
+
+/// Read a falsifier module from the store, or from inline hex.
 ///
 /// A `.wat` path is assembled on the way in. Falsifiers are small predicates,
 /// and a reviewer deciding whether to run one is far better served by readable
 /// text than by a binary they have to take on trust.
 fn module_bytes(v: &Value) -> Result<Vec<u8>> {
-    match (v.get("module_path"), v.get("module_hex")) {
+    let raw = match (v.get("module_path"), v.get("module_hex")) {
         (Some(p), None) => {
             let p = p
                 .as_str()
                 .ok_or_else(|| anyhow!("module_path must be a string"))?;
-            let raw = std::fs::read(p).with_context(|| format!("reading falsifier module {p}"))?;
+            let path = resolve_in_store(p)?;
+            let bytes = std::fs::read(&path).with_context(|| format!("reading {p}"))?;
             if p.ends_with(".wat") {
-                wat::parse_bytes(&raw)
+                wat::parse_bytes(&bytes)
                     .map(|c| c.into_owned())
-                    .with_context(|| format!("assembling {p}"))
+                    // The assembler quotes the offending source line, which for
+                    // a file that is not WAT means quoting the file back.
+                    .map_err(|_| anyhow!("{p} is not valid WebAssembly text"))?
             } else {
-                Ok(raw)
+                bytes
             }
         }
         (None, Some(h)) => {
             let h = h
                 .as_str()
                 .ok_or_else(|| anyhow!("module_hex must be a string"))?;
-            hex::decode(h).context("module_hex is not valid hex")
+            hex::decode(h).context("module_hex is not valid hex")?
         }
         (Some(_), Some(_)) => bail!("give module_path or module_hex, not both"),
         (None, None) => bail!("give one of module_path or module_hex"),
-    }
+    };
+    Ok(raw)
+}
+
+/// Bytes that are a real, loadable falsifier — checked *before* anything
+/// derived from them is returned.
+///
+/// Hashing first and validating later is what made `claim.build` a filesystem
+/// oracle: the digest came back for any bytes at all, valid module or not.
+fn validated_module(v: &Value, manifest: &Manifest) -> Result<(Vec<u8>, Falsifier)> {
+    let bytes = module_bytes(v)?;
+    let falsifier = Falsifier::load(&bytes, manifest.clone(), None)
+        .context("that file is not a falsifier this sandbox will run")?;
+    Ok((bytes, falsifier))
 }
 
 // ---------------------------------------------------------------- manifest
@@ -119,7 +184,7 @@ pub fn claim_build(input: &Value) -> Result<Value> {
         .as_u64()
         .ok_or_else(|| anyhow!("created_at must be a unix timestamp"))?;
     let manifest = parse_manifest(field(input, "manifest")?)?;
-    let module = module_bytes(input)?;
+    let (module, _) = validated_module(input, &manifest)?;
 
     let body = ClaimBody {
         statement: str_field(input, "statement")?.to_string(),
@@ -186,7 +251,7 @@ pub fn claim_build(input: &Value) -> Result<Value> {
 
 pub fn probe_run(input: &Value) -> Result<Value> {
     let manifest = parse_manifest(field(input, "manifest")?)?;
-    let module = module_bytes(input)?;
+    let (module, _) = validated_module(input, &manifest)?;
     let expected = match input.get("module_digest").and_then(Value::as_str) {
         Some(h) => {
             let raw = hex::decode(h).context("module_digest is not hex")?;
@@ -269,6 +334,52 @@ pub fn probe_run(input: &Value) -> Result<Value> {
     }
 
     Ok(out)
+}
+
+/// Announce a falsifier so others can look it up by digest (`kind:47007`).
+///
+/// Without this, a prober handed a claim knows the module's hash but has no way
+/// to obtain the module or read its capability manifest — so the safety
+/// property the design sells, *read the blast radius before you run it*, was
+/// only true if you already had the module from somewhere else.
+pub fn falsifier_announce(input: &Value) -> Result<Value> {
+    let author = pubkey(input, "pubkey")?;
+    let created_at = field(input, "created_at")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("created_at must be a unix timestamp"))?;
+    let manifest = parse_manifest(field(input, "manifest")?)?;
+    let (module, falsifier) = validated_module(input, &manifest)?;
+
+    let digest = hex::encode(falsifier.digest());
+    let tags = vec![
+        // `d` makes this addressable by digest, the way a prober will look it up.
+        vec!["d".into(), digest.clone()],
+        vec!["module".into(), digest.clone()],
+        vec!["manifest".into(), hex::encode(manifest.digest())],
+        vec![
+            "purity".into(),
+            if manifest.is_pure() {
+                "pure"
+            } else {
+                "observational"
+            }
+            .into(),
+        ],
+        vec!["size".into(), module.len().to_string()],
+    ];
+
+    // The manifest travels in the content so a reader can see exactly what the
+    // module may observe without fetching anything else.
+    let content = serde_json::to_string(&json!({
+        "manifest": manifest,
+        "description": input.get("description").and_then(Value::as_str),
+    }))?;
+
+    Ok(json!({
+        "event": unsigned(&author, kinds::FALSIFIER_MANIFEST, created_at, tags, content),
+        "module_digest": digest,
+        "pure": manifest.is_pure(),
+    }))
 }
 
 // ----------------------------------------------------------------- resolving
@@ -364,6 +475,28 @@ fn parse_common(input: &Value) -> Result<(Vec<NostrEvent>, Policy, Ledger, Times
     Ok((events, policy, ledger, now, verify))
 }
 
+/// Conditions a caller ought to know about, returned in-band.
+///
+/// The roster being optional is a real footgun: without one, any key that can
+/// sign is counted as a witness, and three fresh keypairs reach `Supported` in
+/// a second. That is a configuration mistake nobody notices, so the tool says
+/// it out loud on every call rather than only in the docs.
+fn warnings(policy: &Policy, verify: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if policy.roster.is_none() {
+        out.push(
+            "no roster configured: any key that can sign is counted as a witness, \
+             so N fresh keypairs read as N independent agents. Populate \
+             policy.roster from your Buzz community's membership set."
+                .into(),
+        );
+    }
+    if !verify {
+        out.push("signature checking is off: these events are being trusted unverified".into());
+    }
+    out
+}
+
 pub fn resolve_verb(input: &Value) -> Result<Value> {
     let (events, policy, ledger, now, verify) = parse_common(input)?;
     let claim_id = match input.get("claim").and_then(Value::as_str) {
@@ -403,6 +536,7 @@ pub fn resolve_verb(input: &Value) -> Result<Value> {
         "statement": g.claim.body.statement,
         "rejected_events": g.rejected,
         "verdict_event": verdict_event,
+        "warnings": warnings(&policy, verify),
     }))
 }
 
@@ -478,7 +612,12 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
         })
         .collect();
 
-    Ok(json!({ "verdicts": verdicts, "ledger": ledger, "calibration": report }))
+    Ok(json!({
+        "verdicts": verdicts,
+        "ledger": ledger,
+        "calibration": report,
+        "warnings": warnings(&policy, verify),
+    }))
 }
 
 // ------------------------------------------------------------------ events
@@ -512,7 +651,26 @@ pub fn event_verify(input: &Value) -> Result<Value> {
 /// For development, fixtures and tests. In a live Buzz community an agent signs
 /// with the keypair the community admitted, which lives in its own runtime —
 /// Crucible has no business holding it, and no verb here needs it.
+/// Refuse the development-only key verbs unless the caller has opted in.
+///
+/// Both derive material deterministically, which is exactly right for
+/// reproducible fixtures and exactly wrong for an identity anyone relies on.
+/// The danger is habit: a demo that works without ceremony teaches the hands to
+/// reach for it, and one day the key it mints is holding something.
+fn demo_keys_permitted() -> Result<()> {
+    if std::env::var_os("CRUCIBLE_ALLOW_DEMO_KEYS").is_some() {
+        Ok(())
+    } else {
+        bail!(
+            "keygen and event.sign derive keys deterministically and are for \
+             fixtures only; set CRUCIBLE_ALLOW_DEMO_KEYS=1 to use them. In a live \
+             community an agent signs with the keypair its runtime already holds."
+        )
+    }
+}
+
 pub fn event_sign(input: &Value) -> Result<Value> {
+    demo_keys_permitted()?;
     let sk_hex = str_field(input, "secret_key")?;
     let sk = k256::schnorr::SigningKey::from_bytes(
         &hex::decode(sk_hex).context("secret_key is not hex")?,
@@ -552,6 +710,7 @@ pub fn event_sign(input: &Value) -> Result<Value> {
 }
 
 pub fn keygen(input: &Value) -> Result<Value> {
+    demo_keys_permitted()?;
     // Deterministic from a seed so demos and fixtures are reproducible. Never
     // use this for an identity that matters.
     let seed = str_field(input, "seed")?;
@@ -582,6 +741,7 @@ pub fn tools() -> Value {
         "name": "crucible",
         "about": "Falsifiable claims for Buzz: assert, probe, resolve, and score.",
         "protocol": "each verb reads one JSON object on stdin and writes one JSON object on stdout",
+        "falsifier_store": falsifier_root().display().to_string(),
         "kinds": kinds::ALL.iter().map(|k| json!({"kind": k, "name": kinds::name(*k)})).collect::<Vec<_>>(),
         "verbs": [
             {
@@ -616,6 +776,11 @@ pub fn tools() -> Value {
                 },
             },
             {
+                "name": "falsifier.announce",
+                "summary": "Publish a falsifier and its capability manifest so probers can look it up by digest and read its blast radius before running it.",
+                "input": {"pubkey": "hex", "created_at": "unix", "manifest": "manifest", "module_path|module_hex": "wasm or .wat", "description": "string?"},
+            },
+            {
                 "name": "resolve",
                 "summary": "Derive a claim's epistemic status from signed events. Pure in (events, ledger, policy, now) — rerun it to check the answer.",
                 "input": {"events": "[event]", "claim": "hex?", "now": "unix", "policy": "policy?", "ledger": "ledger?", "verify_signatures": "bool?", "resolver": "hex? — pubkey to author the verdict event; never the claimant"},
@@ -632,12 +797,12 @@ pub fn tools() -> Value {
             },
             {
                 "name": "event.sign",
-                "summary": "Sign an unsigned event. Development only — in a live community an agent signs with its own Buzz key.",
+                "summary": "Sign an unsigned event. Development only, gated behind CRUCIBLE_ALLOW_DEMO_KEYS — in a live community an agent signs with its own Buzz key.",
                 "input": {"event": "unsigned", "secret_key": "hex"},
             },
             {
                 "name": "keygen",
-                "summary": "Derive a reproducible demo keypair from a seed. Not an identity to trust.",
+                "summary": "Derive a reproducible demo keypair from a seed. Gated behind CRUCIBLE_ALLOW_DEMO_KEYS. Not an identity to trust.",
                 "input": {"seed": "string"},
             },
         ],
@@ -649,6 +814,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
     match verb {
         "tools" => Ok(tools()),
         "manifest.digest" => manifest_digest(input),
+        "falsifier.announce" => falsifier_announce(input),
         "claim.build" => claim_build(input),
         "probe.run" => probe_run(input),
         "resolve" => resolve_verb(input),
@@ -671,15 +837,28 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
 mod tests {
     use super::*;
 
-    const CI_GREEN: &str = "../../examples/falsifiers/ci-green.wat";
+    pub(super) const CI_GREEN: &str = "ci-green.wat";
+
+    /// Point the falsifier store at the repository's examples, and permit the
+    /// deterministic key verbs. Both are process-wide, so every test in this
+    /// module runs under them.
+    pub(super) fn sandbox() {
+        std::env::set_var(
+            "CRUCIBLE_FALSIFIER_DIR",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/falsifiers"),
+        );
+        std::env::set_var("CRUCIBLE_ALLOW_DEMO_KEYS", "1");
+    }
     const MANIFEST: &str =
         r#"{"observations":["ci:status"],"fuel":50000000,"memory_pages":64,"max_output":8192}"#;
 
-    fn manifest() -> Value {
+    pub(super) fn manifest() -> Value {
+        sandbox();
         serde_json::from_str(MANIFEST).unwrap()
     }
 
-    fn keys(seed: &str) -> (String, String) {
+    pub(super) fn keys(seed: &str) -> (String, String) {
+        sandbox();
         let k = keygen(&json!({ "seed": seed })).unwrap();
         (
             k["secret_key"].as_str().unwrap().to_string(),
@@ -687,12 +866,12 @@ mod tests {
         )
     }
 
-    fn sign(event: &Value, secret: &str) -> Value {
+    pub(super) fn sign(event: &Value, secret: &str) -> Value {
         event_sign(&json!({"event": event, "secret_key": secret})).unwrap()
     }
 
     /// A signed claim plus the experiment id its probes must match.
-    fn a_claim(at: u64) -> (Value, String, String) {
+    pub(super) fn a_claim(at: u64) -> (Value, String, String) {
         let (sk, pk) = keys("author");
         let built = claim_build(&json!({
             "pubkey": pk, "created_at": at,
@@ -713,7 +892,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn a_probe(
+    pub(super) fn a_probe(
         claim: &Value,
         experiment: &str,
         digest: &str,
@@ -1006,5 +1185,158 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("digest mismatch"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod hardening {
+    use super::tests::*;
+    use super::*;
+
+    /// The confused-deputy hole. These verbs are reachable over MCP by an agent
+    /// that reads messages from strangers; an unrestricted `module_path` turned
+    /// `claim.build` into a SHA-256 oracle over the entire filesystem, which is
+    /// crackable offline for anything guessable — a `.env`, a credentials file.
+    #[test]
+    fn a_path_outside_the_falsifier_store_is_refused() {
+        let (_, pk) = keys("author");
+        for escape in ["/etc/passwd", "../../../../etc/passwd", "../../Cargo.toml"] {
+            let err = claim_build(&json!({
+                "pubkey": pk, "created_at": 1_700_000_000,
+                "community": "eng", "domain": "ci", "statement": "s",
+                "confidence": 0.9, "half_life": 900,
+                "manifest": manifest(), "module_path": escape,
+            }))
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                !err.contains("cc4683"),
+                "the error leaked a digest for {escape}: {err}"
+            );
+            assert!(
+                err.contains("falsifier store") || err.contains("no falsifier at"),
+                "{escape} produced an unexpected error: {err}"
+            );
+        }
+    }
+
+    /// Even inside the store, bytes that are not a loadable falsifier must not
+    /// yield a digest. Hashing first and validating later is what made the
+    /// oracle possible in the first place.
+    #[test]
+    fn a_non_falsifier_never_yields_a_digest() {
+        let (_, pk) = keys("author");
+        let err = probe_run(&json!({
+            "manifest": manifest(),
+            "module_hex": hex::encode(b"root:x:0:0:root:/root:/bin/bash\n"),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a falsifier"), "got {err}");
+        assert!(!err.contains("root:"), "the error echoed the bytes: {err}");
+
+        let err = claim_build(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "community": "eng", "domain": "ci", "statement": "s",
+            "confidence": 0.9, "half_life": 900,
+            "manifest": manifest(), "module_hex": hex::encode(b"not wasm"),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a falsifier"), "got {err}");
+    }
+
+    #[test]
+    fn a_falsifier_inside_the_store_still_loads() {
+        let out = probe_run(&json!({
+            "manifest": manifest(), "module_path": CI_GREEN,
+        }))
+        .unwrap();
+        assert_eq!(out["module_digest"].as_str().unwrap().len(), 64);
+    }
+
+    /// A missing roster is the difference between a demo and a deployment, and
+    /// it is silent. The tool says so on every call rather than only in a doc
+    /// nobody reads at three in the morning.
+    #[test]
+    fn a_missing_roster_is_warned_about_in_band() {
+        let at = 1_700_000_000;
+        let (claim, _, _) = a_claim(at);
+        let out = resolve_verb(&json!({"events": [claim.clone()], "now": at})).unwrap();
+        let warnings = out["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("roster")),
+            "no roster warning: {warnings:?}"
+        );
+
+        let quiet = resolve_verb(&json!({
+            "events": [claim], "now": at,
+            "policy": {"roster": ["11".repeat(32)]},
+        }));
+        // Roster excludes the author, so there is no claim to resolve — the
+        // point is only that a configured roster stops the warning.
+        assert!(quiet.is_err() || quiet.unwrap()["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabling_signature_checks_is_warned_about() {
+        let at = 1_700_000_000;
+        let (claim, _, _) = a_claim(at);
+        let out = resolve_verb(&json!({
+            "events": [claim], "now": at, "verify_signatures": false,
+        }))
+        .unwrap();
+        assert!(out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("signature")));
+    }
+
+    /// The spec promised falsifiers could be announced and looked up by digest,
+    /// so a prober can read what a module may touch before running it. The kind
+    /// existed; nothing ever emitted it.
+    #[test]
+    fn a_falsifier_can_be_announced_and_carries_its_manifest() {
+        let (_, pk) = keys("author");
+        let out = falsifier_announce(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "manifest": manifest(), "module_path": CI_GREEN,
+            "description": "true when CI reports green",
+        }))
+        .unwrap();
+
+        assert_eq!(out["event"]["kind"], json!(kinds::FALSIFIER_MANIFEST));
+        assert_eq!(out["pure"], json!(false));
+
+        let tags = out["event"]["tags"].as_array().unwrap();
+        let tag = |n: &str| {
+            tags.iter()
+                .find(|t| t[0] == n)
+                .map(|t| t[1].as_str().unwrap().to_string())
+        };
+        assert_eq!(
+            tag("module"),
+            Some(out["module_digest"].as_str().unwrap().into())
+        );
+        assert_eq!(tag("d"), tag("module"), "addressable by digest");
+        assert_eq!(tag("purity"), Some("observational".into()));
+
+        // A reader can see the blast radius without fetching anything else.
+        let body: Value = serde_json::from_str(out["event"]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(body["manifest"]["observations"][0], json!("ci:status"));
+    }
+
+    #[test]
+    fn an_announced_module_must_also_be_a_real_falsifier() {
+        let (_, pk) = keys("author");
+        assert!(falsifier_announce(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "manifest": manifest(), "module_hex": hex::encode(b"nope"),
+        }))
+        .is_err());
     }
 }

@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 /// Ceilings the sandbox will not exceed regardless of what a manifest asks for.
 /// A manifest is written by whoever wrote the claim, which is to say: not
 /// necessarily by someone acting in the prober's interest.
-pub const MAX_FUEL: u64 = 5_000_000_000;
+/// Roughly a second of interpreted execution, not a minute of it. A claim's
+/// author picks the fuel figure, and whoever runs the probe pays for it — on a
+/// phone, a generous cap is a claim that costs a stranger their battery.
+pub const MAX_FUEL: u64 = 200_000_000;
 pub const MAX_MEMORY_PAGES: u32 = 512; // 32 MiB
 pub const MAX_OUTPUT: u32 = 65_536;
 

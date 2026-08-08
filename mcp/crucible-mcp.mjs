@@ -26,6 +26,11 @@ import { createInterface } from "node:readline";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PROTOCOL_VERSION = "2025-06-18";
 
+// A claim's author chooses its falsifier's fuel budget, and whoever probes it
+// pays. The budget is capped, but a cap is not a deadline: without one, a single
+// expensive claim occupies the server for as long as it likes.
+const CALL_TIMEOUT_MS = Number(process.env.CRUCIBLE_TIMEOUT_MS ?? 20_000);
+
 function findBinary() {
   const explicit = process.env.CRUCIBLE_BIN;
   if (explicit) return explicit;
@@ -39,15 +44,37 @@ function findBinary() {
 const CRUCIBLE = findBinary();
 
 /** Run one verb. Rejects with the CLI's own JSON error, which is already structured. */
-function callCrucible(verb, input) {
+function callCrucible(verb, input, timeoutMs = CALL_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const child = spawn(CRUCIBLE, [verb], { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    // Do not hold the event loop open on the timer alone.
+    timer.unref?.();
+
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
-    child.on("error", (e) => reject(new Error(`cannot run ${CRUCIBLE}: ${e.message}`)));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(new Error(`cannot run ${CRUCIBLE}: ${e.message}`));
+    });
     child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        return reject(
+          new Error(
+            `crucible ${verb} exceeded ${timeoutMs}ms and was stopped. A falsifier ` +
+              `with a large fuel budget can take this long; lower the manifest's fuel, ` +
+              `or raise CRUCIBLE_TIMEOUT_MS if the wait is expected.`,
+          ),
+        );
+      }
       if (code === 0) {
         try {
           resolve(JSON.parse(out));
@@ -121,7 +148,9 @@ const handlers = {
       "with crucible_resolve; read n_eff, not the attestation count, because ten " +
       "agreeing copies of one agent are not ten witnesses. Only `supported` is " +
       "safe to act on: `contested` means the evidence is at war and `insufficient` " +
-      "means nobody has checked.",
+      "means nobody has checked. Read the `warnings` field: without a configured " +
+      "roster, any key that can sign counts as a witness, so N fresh keypairs " +
+      "read as N independent agents.",
   }),
 
   "tools/list": () => ({ tools: TOOLS.map(({ _verb, ...t }) => t) }),
@@ -200,6 +229,8 @@ async function main() {
   }
 
   const lines = createInterface({ input: process.stdin });
+  const inFlight = new Set();
+
   for await (const line of lines) {
     const text = line.trim();
     if (!text) continue;
@@ -214,8 +245,13 @@ async function main() {
       });
       continue;
     }
-    await handle(request);
+    // Do not await: JSON-RPC responses carry their own id, so they may complete
+    // in any order. Awaiting here would let one slow falsifier block every other
+    // request behind it — including the cheap ones an agent is waiting on.
+    const pending = handle(request).finally(() => inFlight.delete(pending));
+    inFlight.add(pending);
   }
+  await Promise.allSettled(inFlight);
 }
 
 main();

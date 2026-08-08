@@ -24,6 +24,7 @@ Run:  python3 agents/crucible_agents.py
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -39,10 +40,20 @@ HALF_LIFE = 900
 T0 = 1_700_000_000
 
 
+# The falsifier store bounds what `module_path` may read, and the demo key
+# verbs are refused without a deliberate opt-in. Both are set here rather than
+# assumed, so running this script never widens anything beyond this process.
+ENV = {
+    **os.environ,
+    "CRUCIBLE_FALSIFIER_DIR": str(ROOT / "examples" / "falsifiers"),
+    "CRUCIBLE_ALLOW_DEMO_KEYS": "1",
+}
+
+
 def crucible(verb: str, payload: dict | None = None) -> dict:
     proc = subprocess.run(
         [str(CRUCIBLE), verb], input=json.dumps(payload or {}),
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=ENV,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"crucible {verb}: {proc.stderr.strip()}")
@@ -127,7 +138,7 @@ class Prover:
             "community": "eng", "domain": "ci",
             "statement": statement, "confidence": confidence,
             "half_life": HALF_LIFE, "inputs": inputs,
-            "manifest": MANIFEST, "module_path": str(FALSIFIER),
+            "manifest": MANIFEST, "module_path": FALSIFIER.name,
             "lineage": self.p.lineage, "env": self.p.env,
         })
         event = self.relay.publish(self.p.sign(built["event"]))
@@ -158,7 +169,7 @@ class Skeptic:
             return None
 
         result = crucible("probe.run", {
-            "manifest": MANIFEST, "module_path": str(FALSIFIER),
+            "manifest": MANIFEST, "module_path": FALSIFIER.name,
             "inputs": claim["inputs"], "observations": self.world,
             "claim": cid, "experiment": claim["experiment"],
             "pubkey": self.p.pubkey, "created_at": at,

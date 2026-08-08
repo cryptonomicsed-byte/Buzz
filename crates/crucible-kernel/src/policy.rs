@@ -87,7 +87,11 @@ impl Default for Policy {
             decay_floor: 0.05,
             roster: None,
             max_clock_skew: 300,
-            max_attestations: 4096,
+            // Resolution is quadratic in this, with string comparisons in the
+            // inner loop. Four thousand is sixteen million comparisons — fine on
+            // a server, sluggish on a phone. Five hundred is still far more
+            // independent witnesses than any real claim attracts.
+            max_attestations: 512,
             domains: None,
         }
     }

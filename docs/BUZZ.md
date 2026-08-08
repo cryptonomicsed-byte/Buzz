@@ -1,8 +1,12 @@
 # Attaching Crucible to a Buzz deployment
 
 Crucible is designed to be additive. There is no relay fork, no schema
-migration, no change to how Buzz authenticates anyone, and nothing an operator
-has to turn on before agents can start using it.
+migration, and no change to how Buzz authenticates anyone.
+
+There is, however, exactly one thing an operator **must** set before this is
+worth deploying: the community's roster. Skip to
+[What an operator has to decide](#what-an-operator-has-to-decide) if you read
+nothing else here.
 
 ## What Buzz already provides, and Crucible relies on
 
@@ -50,7 +54,11 @@ MCP — Goose, Codex, Claude Code via `buzz-acp` — gains the Crucible verbs:
   "crucible": {
     "command": "node",
     "args": ["/path/to/crucible/mcp/crucible-mcp.mjs"],
-    "env": { "CRUCIBLE_BIN": "/path/to/crucible/target/release/crucible" }
+    "env": {
+      "CRUCIBLE_BIN": "/path/to/crucible/target/release/crucible",
+      "CRUCIBLE_FALSIFIER_DIR": "/path/to/falsifier-store",
+      "CRUCIBLE_TIMEOUT_MS": "20000"
+    }
   }
 }
 ```
@@ -84,18 +92,26 @@ service holds no authority: anyone who disagrees can rerun it and publish a
 competing verdict, and the two can be compared line by line because both ship
 the full derivation.
 
+`CRUCIBLE_FALSIFIER_DIR` is not optional in this configuration. The agent on the
+other end of this server reads messages from strangers, and `module_path` is the
+one input that touches the filesystem; bounding it to a store is what stops a
+crafted message from turning `claim.build` into a hash oracle over the host.
+
 ## What an operator has to decide
 
-One thing: the community's [`Policy`](../crates/crucible-kernel/src/policy.rs).
+Two things. First, the community's
+[`Policy`](../crates/crucible-kernel/src/policy.rs).
 
 ```jsonc
 {
   "min_n_eff": 2.0,           // independent probes before anything resolves
   "support_threshold": 0.90,
   "refute_threshold": 0.10,
-  "conflict_floor": 0.5,      // weight each side needs to count as a controversy
+  "conflict_floor": 0.7,      // weight each side needs to count as a controversy
   "conflict_ratio": 0.25,     // how close the weaker side must be
-  "decay_floor": 0.05
+  "decay_floor": 0.05,
+  "max_clock_skew": 300,      // how far ahead an event may be dated
+  "max_attestations": 512     // resolution is quadratic in this
 }
 ```
 
@@ -104,6 +120,19 @@ for claims a room will act on without a human in the loop. A channel tracking
 build status is fine with the defaults. This is per-community on purpose: Buzz
 already treats each community as its own semantic boundary, and epistemic
 standards belong to the room, not to the substrate.
+
+Second, and more important: **populate `roster`.** It is `None` by default,
+which means every key that can sign is counted as a witness — three fresh
+keypairs with three invented lineages reach `Supported` in about a second, and
+no arithmetic over the events can prevent it, because the events are what the
+adversary controls. Fill it from your community's membership set:
+
+```jsonc
+{ "roster": ["<npub-hex>", "<npub-hex>", "..."] }
+```
+
+`resolve` and `ledger.replay` return a `warnings` array that says so on every
+call until you do. Treat a warning there as a deployment blocker.
 
 ## Reading a verdict in a channel
 

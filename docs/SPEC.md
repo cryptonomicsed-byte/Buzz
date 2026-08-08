@@ -23,6 +23,12 @@ other's events.
 | 47006 | `belief-snapshot` | Digest of current belief, for fast bootstrap |
 | 47007 | `falsifier-manifest` | Announcement of a reusable falsifier |
 
+Emit a `47007` with `crucible falsifier.announce`. It carries the module digest
+as both `d` and `module` (so it is addressable by digest), the manifest digest,
+the purity, and the full manifest in its content — so a prober can read exactly
+what a module may observe before deciding to run it, without fetching the module
+first.
+
 `crates/crucible-core/src/kinds.rs` carries a test that fails if any of these
 ever collides with a known Buzz kind.
 
@@ -108,6 +114,11 @@ Somebody ran the falsifier and signed what happened.
 
 Content is the falsifier's explanation.
 
+An attestation dated more than `max_clock_skew` seconds ahead of the resolver's
+`now` is refused. Age drives decay and `created_at` is self-declared, so without
+that bound a probe dated to the year 2100 would never age at all — a claim with
+a fifteen-minute half-life, permanently fresh, from one integer.
+
 `indeterminate` is not a quiet vote for the claim. A falsifier that trapped,
 starved or was denied an observation has said something about *itself*, and
 reading that as refutation would let anyone refute anything by shipping a
@@ -148,24 +159,37 @@ challenge costs exactly what a bold wrong claim does.
 
 A verdict is **not authoritative**. It is a computation over events the relay
 already holds, published so anyone can recompute it and publish a different one
-if they disagree. Two replicas replaying the same log at the same `now` derive
-byte-identical verdicts.
+if they disagree, and it is authored by whoever ran the resolver — never by the
+claimant, since a judgment the judged party signs is not a judgment.
+
+Two replicas replaying the same log at the same `now` derive the same verdict,
+with two honest caveats: the arithmetic uses `exp`/`ln`, which are not correctly
+rounded and may differ in the last bit between libm implementations; and
+determinism given identical inputs says nothing about whether your inputs were
+*complete*. A relay that withholds the refuting attestations yields a confident,
+fully auditable, wrong verdict.
 
 ### How status is decided
 
 In order, first match wins:
 
-1. **`nondeterministic`** — the falsifier declared itself pure and two probes
-   produced different output. Nothing computed from a broken experiment means
-   anything, so this outranks everything.
+1. **`nondeterministic`** — the falsifier declared itself pure and *at least two
+   independent* probes reported an output the majority did not. Nothing computed
+   from a broken experiment means anything, so this outranks everything. Two,
+   not one: `output_digest` is self-reported and this status never resolves and
+   never scores anyone, so a single fabricated digest would otherwise condemn
+   any pure claim permanently, for free.
 2. **`decayed`** — past `expiry`, or evidence once existed and has aged below
    the floor.
 3. **`insufficient`** — fewer than `min_n_eff` independent probes.
 4. **`contested`** — both sides carry real, comparable weight *among probes*.
    The author's own forecast is excluded here: letting it count as one side
    would let a claimant manufacture a controversy by asserting against the
-   evidence. A relative ratio is required as well as an absolute floor, so a
-   lone dissenter cannot freeze an overwhelming claim forever.
+   evidence. A relative ratio is required as well as an absolute floor, and the
+   floor sits above a single unproven key's weight — `contested` has no
+   arbitration and costs its trigger nothing, so one throwaway keypair must not
+   be able to freeze a claim. Two independent dissenters, or one with an earned
+   record, still contest immediately.
 5. **`supported`** / **`refuted`** — mass past the threshold.
 6. **`insufficient`** — otherwise.
 
@@ -199,4 +223,7 @@ for "empty" would go on to judge a world it never saw.
 
 All fields default; `{}` is a pure manifest. Limits are clamped on
 canonicalization, because the manifest is written by whoever wrote the claim —
-not necessarily by somebody acting in the prober's interest.
+not necessarily by somebody acting in the prober's interest. The fuel ceiling is
+deliberately modest (`200_000_000`, roughly a second of interpreted execution):
+the author picks the figure and the prober pays for it, and on a phone a
+generous cap is a claim that costs a stranger their battery.

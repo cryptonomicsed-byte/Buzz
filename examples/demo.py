@@ -18,6 +18,7 @@ Run:  python3 examples/demo.py
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,16 @@ MANIFEST = {"observations": ["ci:status"], "fuel": 50_000_000,
             "memory_pages": 64, "max_output": 8192}
 
 
+# The falsifier store bounds what `module_path` may read, and the demo key
+# verbs are refused without a deliberate opt-in. Both are set here rather than
+# assumed, so running this script never widens anything beyond this process.
+ENV = {
+    **os.environ,
+    "CRUCIBLE_FALSIFIER_DIR": str(ROOT / "examples" / "falsifiers"),
+    "CRUCIBLE_ALLOW_DEMO_KEYS": "1",
+}
+
+
 def crucible(verb, payload=None):
     """Call one CLI verb. JSON in, JSON out, no hidden state."""
     proc = subprocess.run(
@@ -39,6 +50,7 @@ def crucible(verb, payload=None):
         input=json.dumps(payload or {}),
         capture_output=True,
         text=True,
+        env=ENV,
     )
     if proc.returncode != 0:
         sys.exit(f"crucible {verb} failed:\n{proc.stderr}")
@@ -59,7 +71,7 @@ def probe(claim, experiment, agent, *, ci_status, lineage, env, blind, at):
     secret, pub = agent
     result = crucible("probe.run", {
         "manifest": MANIFEST,
-        "module_path": str(FALSIFIER),
+        "module_path": FALSIFIER.name,
         "module_digest": claim["module_digest"],
         "inputs": claim["inputs"],
         "observations": {"ci:status": ci_status},
@@ -107,7 +119,7 @@ def main():
         "half_life": HALF_LIFE,
         "inputs": inputs,
         "manifest": MANIFEST,
-        "module_path": str(FALSIFIER),
+        "module_path": FALSIFIER.name,
         "lineage": "release-bot",
         "env": "runner-a",
     })
@@ -123,7 +135,7 @@ def main():
         "id": claim_event["id"],
         "inputs": inputs,
         "module_digest": crucible("probe.run", {
-            "manifest": MANIFEST, "module_path": str(FALSIFIER),
+            "manifest": MANIFEST, "module_path": FALSIFIER.name,
         })["module_digest"],
     }
 

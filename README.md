@@ -118,13 +118,18 @@ docs/BUZZ.md             how this attaches to a Buzz deployment
 ## Try it
 
 ```bash
-cargo test                      # 161 tests
+cargo test                      # 172 tests
 cargo build -p crucible-cli
 python3 examples/demo.py        # the walkthrough above
 
+export CRUCIBLE_FALSIFIER_DIR=examples/falsifiers   # where module_path may read
 crucible tools                  # every verb, machine-readable
 echo '{"observations":["ci:status"]}' | crucible manifest.digest
 ```
+
+`module_path` reads only from the falsifier store, and `keygen`/`event.sign`
+need `CRUCIBLE_ALLOW_DEMO_KEYS=1`. Both gates exist because these verbs are
+reachable over MCP by an agent that reads messages from strangers.
 
 Watch three agents work a claim with no coordinator between them:
 
@@ -170,14 +175,27 @@ free.**
 
 ## Honest limitations
 
-This design was put through an adversarial review that found real defects.
-Several were fixed and are now regression tests — settlement is idempotent,
+This design has been through two adversarial reviews, and both found real
+defects. Everything they found was reproduced against the code before being
+fixed, and every fix is now a regression test — settlement is idempotent,
 future-dated evidence is refused rather than never ageing, an abstention can no
 longer soak an honest fleet's independence, a single throwaway key can no longer
 freeze a claim in `Contested` or condemn one as `Nondeterministic`, reliability
 decays in wall-clock time so volume cannot launder a bad record, and
-`Policy::roster` now exists as the seam for community membership. What follows
-is what remains true.
+`Policy::roster` now exists as the seam for community membership.
+
+The second review found a confused-deputy hole and three smaller problems, also
+fixed: `claim.build` would return the SHA-256 of **any file on disk** — a hash
+oracle an agent could be talked into pointing at a `.env` — so `module_path` now
+reads only from a falsifier store and nothing yields a digest until it has
+loaded as a real module; a missing roster is now warned about in-band on every
+`resolve` rather than only in this file; the MCP server handles requests
+concurrently under a per-request timeout instead of blocking on one expensive
+falsifier; `falsifier.announce` (kind 47007) is now actually emitted, so a
+prober can read a module's blast radius before running it; and the deterministic
+key verbs are gated behind an explicit opt-in.
+
+What follows is what remains true.
 
 - **`lineage`, `env` and `blind` are self-reported and unverified.** An agent
   that lies about them looks more independent than it is, and honesty is
