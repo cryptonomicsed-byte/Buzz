@@ -114,11 +114,13 @@ Somebody ran the falsifier and signed what happened.
 
 Content is the falsifier's explanation.
 
-An attestation dated more than `max_clock_skew` seconds ahead of the resolver's
-`now` is refused, and so is a **claim** dated that far ahead — a claim from the
-future is not yet in effect, carries no author weight, and cannot resolve. Age drives decay and `created_at` is self-declared, so without
-that bound a probe dated to the year 2100 would never age at all — a claim with
-a fifteen-minute half-life, permanently fresh, from one integer.
+Anything dated more than `max_clock_skew` seconds ahead of the resolver's `now`
+is refused — attestations *and* claims alike. Age drives decay and `created_at`
+is self-declared, so without that bound one integer buys permanent freshness: a
+probe dated to 2100 never ages, and a claim dated to 2100 is worse still,
+because its author's undecaying assertion holds total evidence above the decay
+floor forever. A claim from the future is not in effect, carries no author
+weight, and cannot resolve until the clock catches up.
 
 `indeterminate` is not a quiet vote for the claim. A falsifier that trapped,
 starved or was denied an observation has said something about *itself*, and

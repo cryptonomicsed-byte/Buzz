@@ -82,9 +82,6 @@ class Relay:
             self.path.write_text(json.dumps(self.events, indent=2))
         return event
 
-    def of_kind(self, kind: int) -> list[dict]:
-        return [e for e in self.events if e["kind"] == kind]
-
 
 @dataclass
 class Profile:
