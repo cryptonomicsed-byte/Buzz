@@ -14,7 +14,7 @@ use crucible_core::{
     PubKey, Signature, Timestamp,
 };
 use crucible_kernel::{resolve, settle, Ledger, Policy};
-use crucible_probe::{Falsifier, Manifest, Observations};
+use crucible_probe::{audit_vacuity, Falsifier, Manifest, Observations};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -203,7 +203,7 @@ pub fn claim_build(input: &Value) -> Result<Value> {
         .as_u64()
         .ok_or_else(|| anyhow!("created_at must be a unix timestamp"))?;
     let manifest = parse_manifest(field(input, "manifest")?)?;
-    let (module, _) = validated_module(input, &manifest)?;
+    let (module, falsifier) = validated_module(input, &manifest)?;
 
     let body = ClaimBody {
         statement: str_field(input, "statement")?.to_string(),
@@ -213,6 +213,21 @@ pub fn claim_build(input: &Value) -> Result<Value> {
             .map(str::to_string),
         inputs: input.get("inputs").cloned().unwrap_or(json!({})),
     };
+
+    // "No falsifier, no claim" only means something if the falsifier can
+    // actually change its mind. A pure module whose outcome never moves under
+    // any structural mutation of its own declared inputs is not testing
+    // them — it is a constant wearing a falsifier's shape, and no digest
+    // chain distinguishes it from a real one. Observational falsifiers are
+    // exempt: they legitimately answer from what they observe, not `inputs`.
+    let audit = audit_vacuity(&falsifier, &body.inputs, &Observations::new());
+    if audit.vacuous {
+        bail!(
+            "this falsifier does not appear to depend on its declared inputs ({}); \
+             a claim needs something that could actually falsify it",
+            audit.reason
+        );
+    }
 
     let confidence = field(input, "confidence")?
         .as_f64()
@@ -538,6 +553,36 @@ pub fn provenance_attest(input: &Value) -> Result<Value> {
             pa.to_unsigned_tags(),
             String::new(),
         ),
+    }))
+}
+
+/// Check whether a pure falsifier actually depends on its declared inputs.
+///
+/// `claim.build` already refuses a vacuous pure falsifier; this verb exists so
+/// an author (or a reviewer handed someone else's module) can run the same
+/// check standalone, before spending a signature on a claim, or against
+/// inputs other than the ones a particular claim happens to declare.
+pub fn falsifier_audit(input: &Value) -> Result<Value> {
+    let manifest = parse_manifest(field(input, "manifest")?)?;
+    let (_, falsifier) = validated_module(input, &manifest)?;
+    let inputs = input.get("inputs").cloned().unwrap_or(json!({}));
+
+    let mut observations = Observations::new();
+    if let Some(map) = input.get("observations").and_then(Value::as_object) {
+        for (k, v) in map {
+            let s = v
+                .as_str()
+                .ok_or_else(|| anyhow!("observation `{k}` must be a string"))?;
+            observations.insert(k.clone(), s.as_bytes().to_vec());
+        }
+    }
+
+    let audit = audit_vacuity(&falsifier, &inputs, &observations);
+    Ok(json!({
+        "applicable": audit.applicable,
+        "vacuous": audit.vacuous,
+        "mutations_tried": audit.mutations_tried,
+        "reason": audit.reason,
     }))
 }
 
@@ -1040,6 +1085,11 @@ pub fn tools() -> Value {
                 "input": {"event": "signed attestation event", "manifest": "manifest", "module_path|module_hex": "wasm or .wat", "inputs": "the claim's declared inputs, json"},
             },
             {
+                "name": "falsifier.audit",
+                "summary": "Check whether a pure falsifier's outcome actually depends on its declared inputs, by running it against structural mutations of them. A module that never moves is a constant wearing a falsifier's shape. claim.build runs this automatically and refuses a vacuous one; call it standalone to check a module before committing to a claim.",
+                "input": {"manifest": "manifest", "module_path|module_hex": "wasm or .wat", "inputs": "json?", "observations": "{key: string}?"},
+            },
+            {
                 "name": "falsifier.announce",
                 "summary": "Publish a falsifier and its capability manifest so probers can look it up by digest and read its blast radius before running it.",
                 "input": {"pubkey": "hex", "created_at": "unix", "manifest": "manifest", "module_path|module_hex": "wasm or .wat", "description": "string?"},
@@ -1079,6 +1129,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
         "tools" => Ok(tools()),
         "manifest.digest" => manifest_digest(input),
         "falsifier.announce" => falsifier_announce(input),
+        "falsifier.audit" => falsifier_audit(input),
         "claim.build" => claim_build(input),
         "probe.run" => probe_run(input),
         "attestation.verify" => attestation_verify(input),
@@ -2116,5 +2167,101 @@ mod provenance_attestation {
         .unwrap_err()
         .to_string();
         assert!(err.contains("expiry"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod falsifier_vacuity {
+    use super::tests::*;
+    use super::*;
+
+    /// A pure manifest (no observations) so vacuity applies.
+    fn pure_manifest() -> Value {
+        sandbox();
+        json!({})
+    }
+
+    /// Ignores its declared inputs entirely — the literal shape of the bug
+    /// named in the review: a valid, pure, deterministic falsifier for any
+    /// sentence you attach it to.
+    const ALWAYS_HOLDS: &str = r#"
+    (module
+      (import "crucible" "emit" (func $emit (param i32 i32 i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0) "ok")
+      (func (export "crucible_falsify")
+        (call $emit (i32.const 1) (i32.const 0) (i32.const 2))))
+    "#;
+
+    /// Refutes when the declared inputs, JSON-encoded, are shorter than 10
+    /// bytes — a pure module that genuinely depends on its inputs.
+    const LENGTH_SENSITIVE: &str = r#"
+    (module
+      (import "crucible" "input_len" (func $input_len (result i32)))
+      (import "crucible" "emit" (func $emit (param i32 i32 i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 100) "checked")
+      (func (export "crucible_falsify")
+        (if (i32.lt_s (call $input_len) (i32.const 10))
+          (then (call $emit (i32.const 1) (i32.const 100) (i32.const 7)))
+          (else (call $emit (i32.const 2) (i32.const 100) (i32.const 7))))))
+    "#;
+
+    fn module_hex(wat: &str) -> String {
+        hex::encode(wat::parse_str(wat).unwrap())
+    }
+
+    #[test]
+    fn claim_build_refuses_a_pure_falsifier_that_ignores_its_inputs() {
+        let (_, pk) = keys("author");
+        let err = claim_build(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "community": "eng", "domain": "ci",
+            "statement": "the sha is deadbeef", "confidence": 0.9,
+            "half_life": 900, "inputs": {"sha": "deadbeef"},
+            "manifest": pure_manifest(), "module_hex": module_hex(ALWAYS_HOLDS),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not appear to depend"), "got {err}");
+    }
+
+    #[test]
+    fn claim_build_accepts_a_pure_falsifier_that_reads_its_inputs() {
+        let (_, pk) = keys("author");
+        let out = claim_build(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "community": "eng", "domain": "ci",
+            "statement": "the input is short", "confidence": 0.9,
+            "half_life": 900, "inputs": "checked",
+            "manifest": pure_manifest(), "module_hex": module_hex(LENGTH_SENSITIVE),
+        }))
+        .unwrap();
+        assert_eq!(out["pure"], json!(true));
+    }
+
+    #[test]
+    fn falsifier_audit_flags_a_vacuous_pure_module_standalone() {
+        let out = falsifier_audit(&json!({
+            "manifest": pure_manifest(), "module_hex": module_hex(ALWAYS_HOLDS),
+            "inputs": {"sha": "deadbeef"},
+        }))
+        .unwrap();
+        assert_eq!(out["applicable"], json!(true));
+        assert_eq!(out["vacuous"], json!(true));
+    }
+
+    #[test]
+    fn falsifier_audit_is_not_applicable_to_an_observational_module() {
+        // CI_GREEN reads `ci:status` through its manifest, so vacuity against
+        // `inputs` does not apply to it at all.
+        let out = falsifier_audit(&json!({
+            "manifest": manifest(), "module_path": CI_GREEN,
+            "inputs": {"sha": "deadbeef"},
+            "observations": {"ci:status": "green"},
+        }))
+        .unwrap();
+        assert_eq!(out["applicable"], json!(false));
+        assert_eq!(out["vacuous"], json!(false));
     }
 }

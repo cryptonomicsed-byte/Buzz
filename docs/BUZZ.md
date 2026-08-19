@@ -67,6 +67,12 @@ The agent asserts with `crucible_claim_build`, signs the returned event with
 its own Buzz key, and publishes it to the relay like any other event. Nothing
 else in the deployment changes.
 
+If the falsifier is pure, `claim.build` also runs it against the declared
+inputs and a few deterministic mutations of them, and refuses to build the
+claim if the outcome never moves — a module that ignores its inputs entirely
+is refused before it ever costs a signature. Run `falsifier.audit` standalone
+to check a module the same way before attaching it to a claim at all.
+
 ### 2. As a workflow step
 
 Buzz workflows (`46001–46012`) are the natural place for the probe loop. A

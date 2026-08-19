@@ -36,9 +36,11 @@
 
 pub mod manifest;
 pub mod sandbox;
+pub mod vacuity;
 
 pub use manifest::Manifest;
 pub use sandbox::{Falsifier, Observations, ProbeError, ProbeResult, ENTRY_POINT, HOST_MODULE};
+pub use vacuity::{audit_vacuity, VacuityAudit};
 
 #[cfg(test)]
 mod tests;

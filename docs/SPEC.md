@@ -71,6 +71,24 @@ world-reading probe as broken the first time two agents saw different worlds.
 Purity is not a free assertion: it is derived from the capability manifest,
 whose digest the author signed. A manifest granting no observations is pure.
 
+Content addressing proves two agents ran the same bytes; it says nothing
+about whether those bytes check anything. A pure module that ignores its
+inputs and always emits `holds` is a valid, deterministic falsifier for any
+`statement` you attach it to, and no digest chain distinguishes it from a
+real one — see [README.md](../README.md#honest-limitations), "nothing binds
+the statement to the falsifier." `crucible-cli`'s `claim.build` narrows one
+concrete instance of this: for a pure falsifier it runs
+`crucible_probe::audit_vacuity`, which re-runs the module against the
+declared inputs and against a few deterministic structural mutations of them
+(emptied, every leaf negated, every leaf nulled) and refuses to build the
+claim if the outcome never moves. This is a heuristic on a mechanical
+property — input-sensitivity — not a proof the predicate means what the
+statement says; a module sensitive to the wrong field of its inputs would
+pass it while still being wrong about the claim. `falsifier.audit` exposes
+the same check standalone, for an author or reviewer to run against a module
+before committing to a claim at all. Observational falsifiers are exempt:
+they legitimately answer from what they observe, not from `inputs`.
+
 ### Content
 
 ```json

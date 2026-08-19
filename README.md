@@ -245,9 +245,22 @@ What follows is what remains true.
 - **There is no exogenous ground truth.** `settle` scores agents against the
   kernel's own verdict, which is a function of their reports. That measures
   conformity, and a colluding majority is correct by construction.
-- **Nothing binds the natural-language statement to the falsifier.** A module
-  that ignores its inputs and returns `holds` is a valid, pure, deterministic
-  falsifier for any sentence you attach it to.
+- **Nothing binds the natural-language statement to the falsifier's
+  correctness.** Content addressing proves two agents ran the same bytes; it
+  proves nothing about whether those bytes check what the statement claims.
+  `claim.build` now catches the literal failure mode named above: for a pure
+  falsifier it runs `crucible_probe::audit_vacuity`, which re-runs the module
+  against its declared inputs and a few deterministic structural mutations of
+  them, and refuses the claim if the outcome never moves — a module that
+  ignores its inputs and returns `holds` unconditionally can no longer be
+  attached to a claim silently (`falsifier.audit` runs the same check
+  standalone). This is a mechanical heuristic on input-sensitivity, not a
+  proof of semantic correctness: a module sensitive to the wrong field of its
+  inputs, or one that is genuinely (not vacuously) insensitive to the
+  mutations tried, would pass or fail for reasons unrelated to whether it
+  actually tests the English sentence beside it. Full semantic binding
+  between prose and predicate is not implemented and is not something a
+  deterministic function of bytes can fully provide.
 - **Verdicts are complete only if your event set was.** A relay that withholds
   the refuting attestations yields a confident, fully auditable, wrong verdict.
   Multi-relay reads are the mitigation and are not implemented.
