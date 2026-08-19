@@ -3,6 +3,8 @@ use crate::event::NostrEvent;
 use crate::ids::{EventId, PubKey};
 use crate::{kinds, Timestamp};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// What running the falsifier produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +105,26 @@ impl Provenance {
     }
 }
 
+/// What a falsifier saw, keyed by observation, with the raw bytes it read.
+///
+/// A plain type alias rather than a newtype: this is deliberately the exact
+/// shape `crucible-probe`'s sandbox already gathers observations into, so a
+/// prober can embed what it actually passed the falsifier without a
+/// conversion step, and a verifier can feed the same map straight back in.
+pub type Observations = BTreeMap<String, Vec<u8>>;
+
+/// SHA-256 of the canonical form of an observation set.
+///
+/// `BTreeMap`'s `Serialize` impl visits keys in sorted order, so this is
+/// stable regardless of the order observations were gathered or inserted in —
+/// the same property [`crate::claim::ClaimBody::inputs_digest`] relies on for
+/// declared inputs.
+pub fn observations_digest(observations: &Observations) -> [u8; 32] {
+    let bytes =
+        serde_json::to_vec(observations).expect("BTreeMap<String, Vec<u8>> always serializes");
+    Sha256::digest(bytes).into()
+}
+
 /// A signed record of one agent independently running a claim's falsifier
 /// (`kind:47002`).
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +143,14 @@ pub struct Attestation {
     /// which is a defect in the *claim*, and worth surfacing rather than
     /// averaging away.
     pub output_digest: [u8; 32],
+    /// SHA-256 of the observations the falsifier actually read, per
+    /// [`observations_digest`]. Committing to this — with the observations
+    /// themselves carried in the event's `content` — is what turns "somebody
+    /// ran the falsifier" into something a third party can *redo*: fetch this
+    /// event, the falsifier module, and the manifest, replay it with these
+    /// exact observations, and check the same `output_digest` comes out. Zero
+    /// for a pure falsifier, which by construction observed nothing.
+    pub observations_digest: [u8; 32],
     /// Fuel consumed by the sandbox. Recorded for readers and for cost
     /// accounting; the kernel does not currently use it, though divergent fuel
     /// on identical inputs would be a cheap second non-determinism signal.
@@ -131,6 +161,49 @@ pub struct Attestation {
 fn parse_digest(s: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     (s.len() == 64 && hex::decode_to_slice(s, &mut out).is_ok()).then_some(out)
+}
+
+/// The `{"explanation": ..., "observations": {...}}` shape carried in an
+/// attestation event's `content`. A thin, serializable mirror of the pieces an
+/// attestation needs to publish beyond its tags — kept separate from
+/// [`Attestation`] itself because `content` is free-form NIP-01 payload, not
+/// wire-format the kernel parses.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AttestationContent {
+    #[serde(default)]
+    pub explanation: String,
+    /// Base64-encoded observation values — `content` is a JSON string field,
+    /// and observations are arbitrary bytes, not necessarily valid UTF-8.
+    #[serde(default, with = "observations_b64")]
+    pub observations: Observations,
+}
+
+mod observations_b64 {
+    use super::Observations;
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(obs: &Observations, s: S) -> Result<S::Ok, S::Error> {
+        let encoded: BTreeMap<&String, String> = obs
+            .iter()
+            .map(|(k, v)| (k, base64::engine::general_purpose::STANDARD.encode(v)))
+            .collect();
+        encoded.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Observations, D::Error> {
+        let encoded: BTreeMap<String, String> = BTreeMap::deserialize(d)?;
+        encoded
+            .into_iter()
+            .map(|(k, v)| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&v)
+                    .map(|bytes| (k, bytes))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
 }
 
 impl Attestation {
@@ -151,6 +224,11 @@ impl Attestation {
             experiment: ev.parse_tag("experiment", "not a 32-byte hex digest", parse_digest)?,
             outcome: ev.parse_tag("outcome", "not holds/fails/indeterminate", Outcome::parse)?,
             output_digest: ev.parse_tag("digest", "not a 32-byte hex digest", parse_digest)?,
+            observations_digest: ev.parse_tag(
+                "observations",
+                "not a 32-byte hex digest",
+                parse_digest,
+            )?,
             fuel: ev.parse_tag("fuel", "not an integer", |v| v.parse().ok())?,
             provenance: Provenance {
                 lineage: ev.require_tag("lineage")?.to_string(),
@@ -171,11 +249,32 @@ impl Attestation {
             vec!["experiment".into(), hex::encode(self.experiment)],
             vec!["outcome".into(), self.outcome.as_str().into()],
             vec!["digest".into(), hex::encode(self.output_digest)],
+            vec!["observations".into(), hex::encode(self.observations_digest)],
             vec!["fuel".into(), self.fuel.to_string()],
             vec!["lineage".into(), self.provenance.lineage.clone()],
             vec!["env".into(), self.provenance.env.clone()],
             vec!["blind".into(), self.provenance.blind.to_string()],
         ]
+    }
+
+    /// Parse this attestation's `content` as [`AttestationContent`] and check
+    /// its embedded observations actually hash to what the `observations` tag
+    /// claims. This is the check a third-party auditor runs before trusting
+    /// the embedded observations enough to replay the falsifier with them —
+    /// without it, an attestor could publish a digest that matches nothing it
+    /// actually embedded.
+    pub fn verify_content(&self, ev: &NostrEvent) -> Result<AttestationContent> {
+        let content: AttestationContent =
+            serde_json::from_str(&ev.content).map_err(|e| Error::BadContent(e.to_string()))?;
+        let computed = observations_digest(&content.observations);
+        if computed != self.observations_digest {
+            return Err(Error::BadTag {
+                tag: "observations",
+                value: hex::encode(self.observations_digest),
+                reason: "does not match the observations embedded in content",
+            });
+        }
+        Ok(content)
     }
 
     /// Reject an attestation that is about a different experiment than the claim
@@ -263,6 +362,134 @@ mod tests {
         let informed = prov("m1", "e1", false);
         let blind = prov("m2", "e2", true);
         assert_eq!(blind.similarity(&informed), 0.0);
+    }
+
+    #[test]
+    fn observations_digest_is_key_order_independent() {
+        let mut a = Observations::new();
+        a.insert("b".into(), b"2".to_vec());
+        a.insert("a".into(), b"1".to_vec());
+        let mut b = Observations::new();
+        b.insert("a".into(), b"1".to_vec());
+        b.insert("b".into(), b"2".to_vec());
+        assert_eq!(observations_digest(&a), observations_digest(&b));
+    }
+
+    #[test]
+    fn observations_digest_changes_with_the_value() {
+        let mut a = Observations::new();
+        a.insert("k".into(), b"green".to_vec());
+        let mut b = Observations::new();
+        b.insert("k".into(), b"red".to_vec());
+        assert_ne!(observations_digest(&a), observations_digest(&b));
+    }
+
+    #[test]
+    fn an_empty_observation_set_has_a_fixed_digest() {
+        // A pure falsifier observes nothing; this is what its attestations
+        // should carry, and it must be stable so every pure-claim attestation
+        // agrees on it without anyone having computed it by hand.
+        assert_eq!(
+            hex::encode(observations_digest(&Observations::new())),
+            hex::encode(observations_digest(&Observations::new())),
+        );
+    }
+
+    /// Content is a JSON string field; observation values are arbitrary bytes,
+    /// not necessarily valid UTF-8. Round-tripping through the base64 encoding
+    /// must reproduce the original bytes exactly, non-UTF-8 included.
+    #[test]
+    fn attestation_content_round_trips_binary_observations() {
+        let mut observations = Observations::new();
+        observations.insert("text".into(), b"green".to_vec());
+        observations.insert("binary".into(), vec![0xff, 0x00, 0x9c, 0x01, 0x00]);
+        let content = AttestationContent {
+            explanation: "saw green".into(),
+            observations,
+        };
+        let json = serde_json::to_string(&content).unwrap();
+        let back: AttestationContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.explanation, content.explanation);
+        assert_eq!(back.observations, content.observations);
+    }
+
+    #[test]
+    fn verify_content_rejects_a_digest_that_does_not_match_content() {
+        let mut observations = Observations::new();
+        observations.insert("ci:status".into(), b"green".to_vec());
+        let real_digest = observations_digest(&observations);
+
+        let mut ev = NostrEvent {
+            id: EventId::from_bytes([0; 32]),
+            pubkey: PubKey::from_bytes([1; 32]),
+            created_at: 1_700_000_000,
+            kind: kinds::ATTESTATION,
+            tags: vec![
+                vec!["e".into(), "a".repeat(64), String::new(), "claim".into()],
+                vec!["experiment".into(), "b".repeat(64)],
+                vec!["outcome".into(), "holds".into()],
+                vec!["digest".into(), "c".repeat(64)],
+                // Wrong on purpose: does not match `observations` below.
+                vec!["observations".into(), "d".repeat(64)],
+                vec!["fuel".into(), "1000".into()],
+                vec!["lineage".into(), "l".into()],
+                vec!["env".into(), "e".into()],
+                vec!["blind".into(), "true".into()],
+            ],
+            content: serde_json::to_string(&AttestationContent {
+                explanation: "green".into(),
+                observations: observations.clone(),
+            })
+            .unwrap(),
+            sig: crate::ids::Signature::from_bytes([0; 64]),
+        };
+        ev.id = ev.compute_id();
+        let att = Attestation::from_event(&ev).unwrap();
+        assert_ne!(att.observations_digest, real_digest);
+
+        let err = att.verify_content(&ev).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BadTag {
+                tag: "observations",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_content_accepts_a_matching_digest() {
+        let mut observations = Observations::new();
+        observations.insert("ci:status".into(), b"green".to_vec());
+        let real_digest = hex::encode(observations_digest(&observations));
+
+        let mut ev = NostrEvent {
+            id: EventId::from_bytes([0; 32]),
+            pubkey: PubKey::from_bytes([1; 32]),
+            created_at: 1_700_000_000,
+            kind: kinds::ATTESTATION,
+            tags: vec![
+                vec!["e".into(), "a".repeat(64), String::new(), "claim".into()],
+                vec!["experiment".into(), "b".repeat(64)],
+                vec!["outcome".into(), "holds".into()],
+                vec!["digest".into(), "c".repeat(64)],
+                vec!["observations".into(), real_digest],
+                vec!["fuel".into(), "1000".into()],
+                vec!["lineage".into(), "l".into()],
+                vec!["env".into(), "e".into()],
+                vec!["blind".into(), "true".into()],
+            ],
+            content: serde_json::to_string(&AttestationContent {
+                explanation: "green".into(),
+                observations: observations.clone(),
+            })
+            .unwrap(),
+            sig: crate::ids::Signature::from_bytes([0; 64]),
+        };
+        ev.id = ev.compute_id();
+        let att = Attestation::from_event(&ev).unwrap();
+        let content = att.verify_content(&ev).unwrap();
+        assert_eq!(content.observations, observations);
     }
 
     #[test]

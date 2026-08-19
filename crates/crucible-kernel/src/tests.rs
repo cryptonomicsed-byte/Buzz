@@ -112,6 +112,12 @@ impl ProbeSpec {
                 Outcome::Fails => 2,
                 Outcome::Indeterminate => 3,
             }); 32],
+            // Kernel-level tests never inspect embedded observations, only
+            // that this digest is present and well-formed; an empty
+            // observation set hashes to a fixed, deterministic value.
+            observations_digest: crucible_core::attestation::observations_digest(
+                &crucible_core::attestation::Observations::new(),
+            ),
             fuel: 1000,
             provenance: Provenance {
                 lineage: self.lineage.into(),

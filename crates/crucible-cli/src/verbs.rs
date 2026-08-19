@@ -7,7 +7,7 @@
 //! what the room saw when it happened.
 
 use anyhow::{anyhow, bail, Context, Result};
-use crucible_core::attestation::Provenance;
+use crucible_core::attestation::{observations_digest, AttestationContent, Provenance};
 use crucible_core::claim::{ClaimBody, FalsifierRef};
 use crucible_core::{
     kinds, Attestation, Challenge, Claim, EventId, NostrEvent, PubKey, Signature, Timestamp,
@@ -295,7 +295,7 @@ pub fn probe_run(input: &Value) -> Result<Value> {
         }
     }
 
-    let result = falsifier.run(&inputs_bytes, observations);
+    let result = falsifier.run(&inputs_bytes, observations.clone());
 
     let mut out = json!({
         "outcome": result.outcome.as_str(),
@@ -329,6 +329,7 @@ pub fn probe_run(input: &Value) -> Result<Value> {
             experiment,
             outcome: result.outcome,
             output_digest: result.output_digest,
+            observations_digest: observations_digest(&observations),
             fuel: result.fuel_used,
             provenance: Provenance {
                 lineage: str_field(input, "lineage")?.to_string(),
@@ -342,16 +343,87 @@ pub fn probe_run(input: &Value) -> Result<Value> {
                     .ok_or_else(|| anyhow!("blind must be stated explicitly, true or false"))?,
             },
         };
+        // Observations travel *in the signed content*, not just as a digest in
+        // a tag. Without them, "somebody ran the falsifier" is unfalsifiable by
+        // anyone but the attestor: a third party has the claimed outcome and a
+        // digest of a value it cannot see. With them, anyone holding the
+        // falsifier module can replay this exact run and check the output
+        // digest matches — which is the whole point of shipping an executable
+        // falsifier in the first place.
+        let content = AttestationContent {
+            explanation: String::from_utf8_lossy(&result.explanation).to_string(),
+            observations: observations.clone(),
+        };
         out["attestation"] = serde_json::to_value(unsigned(
             &attestor,
             kinds::ATTESTATION,
             at,
             att.to_unsigned_tags(),
-            String::from_utf8_lossy(&result.explanation).to_string(),
+            serde_json::to_string(&content)?,
         ))?;
     }
 
     Ok(out)
+}
+
+/// Independently redo a probe.
+///
+/// This is the payoff for `probe.run` embedding observations in the signed
+/// event instead of only a digest: given the attestation, the falsifier module
+/// it named, and the claim's declared inputs, a third party — someone who
+/// never ran the original probe and has no reason to trust the attestor beyond
+/// their signature — can re-execute the exact same experiment and check that
+/// the claimed outcome and output digest are what the sandbox actually
+/// produces. An attestation that fails this is not evidence, whatever it
+/// claims about itself.
+pub fn attestation_verify(input: &Value) -> Result<Value> {
+    let event: NostrEvent =
+        serde_json::from_value(field(input, "event")?.clone()).context("event")?;
+    event
+        .verify()
+        .context("attestation event failed signature verification")?;
+    let att = Attestation::from_event(&event)?;
+    // Checks the embedded observations actually hash to what the
+    // `observations` tag claims — otherwise a dishonest attestor could publish
+    // a digest that matches nothing it embedded and let a lazy verifier trust
+    // the tag without ever looking at the content.
+    let content = att.verify_content(&event)?;
+
+    let manifest = parse_manifest(field(input, "manifest")?)?;
+    let (_, falsifier) = validated_module(input, &manifest)?;
+
+    let claim_inputs = input.get("inputs").cloned().unwrap_or(json!({}));
+    let inputs_bytes = serde_json::to_vec(&claim_inputs)?;
+    let inputs_digest: [u8; 32] = Sha256::digest(&inputs_bytes).into();
+
+    let claimed_experiment = FalsifierRef {
+        module: falsifier.digest(),
+        manifest: manifest.digest(),
+        inputs: inputs_digest,
+        pure: manifest.is_pure(),
+    }
+    .experiment_id();
+    if claimed_experiment != att.experiment {
+        bail!(
+            "the supplied module, manifest and inputs reconstruct experiment {}, \
+             but the attestation names {} — this is not a replay of the same probe",
+            hex::encode(claimed_experiment),
+            hex::encode(att.experiment)
+        );
+    }
+
+    let result = falsifier.run(&inputs_bytes, content.observations.clone());
+    let outcome_matches = result.outcome == att.outcome;
+    let digest_matches = result.output_digest == att.output_digest;
+
+    Ok(json!({
+        "verified": outcome_matches && digest_matches,
+        "experiment_matches": true,
+        "claimed": { "outcome": att.outcome.as_str(), "output_digest": hex::encode(att.output_digest) },
+        "replayed": { "outcome": result.outcome.as_str(), "output_digest": hex::encode(result.output_digest) },
+        "explanation": content.explanation,
+        "observations": content.observations.keys().collect::<Vec<_>>(),
+    }))
 }
 
 /// Announce a falsifier so others can look it up by digest (`kind:47007`).
@@ -815,6 +887,11 @@ pub fn tools() -> Value {
                 },
             },
             {
+                "name": "attestation.verify",
+                "summary": "Independently redo a probe: replay an attestation's embedded observations through its falsifier and check the claimed outcome and digest actually come out.",
+                "input": {"event": "signed attestation event", "manifest": "manifest", "module_path|module_hex": "wasm or .wat", "inputs": "the claim's declared inputs, json"},
+            },
+            {
                 "name": "falsifier.announce",
                 "summary": "Publish a falsifier and its capability manifest so probers can look it up by digest and read its blast radius before running it.",
                 "input": {"pubkey": "hex", "created_at": "unix", "manifest": "manifest", "module_path|module_hex": "wasm or .wat", "description": "string?"},
@@ -856,6 +933,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
         "falsifier.announce" => falsifier_announce(input),
         "claim.build" => claim_build(input),
         "probe.run" => probe_run(input),
+        "attestation.verify" => attestation_verify(input),
         "resolve" => resolve_verb(input),
         "ledger.replay" => ledger_replay(input),
         "event.verify" => event_verify(input),
@@ -1364,6 +1442,156 @@ mod hardening {
         }))
         .unwrap();
         assert_eq!(out["module_digest"].as_str().unwrap().len(), 64);
+    }
+
+    /// The payoff for embedding observations: a third party who never ran the
+    /// original probe, holding only the signed attestation and the falsifier,
+    /// can redo the experiment and confirm the same output comes out.
+    #[test]
+    fn attestation_verify_replays_the_probe_independently() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let probe = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "prober",
+            "green",
+            "prover",
+            at,
+        );
+
+        let out = attestation_verify(&json!({
+            "event": probe,
+            "manifest": manifest(),
+            "module_path": CI_GREEN,
+            "inputs": {"sha": "deadbeef"},
+        }))
+        .unwrap();
+
+        assert_eq!(out["verified"], json!(true));
+        assert_eq!(out["claimed"]["outcome"], json!("holds"));
+        assert_eq!(out["replayed"]["outcome"], json!("holds"));
+        assert_eq!(
+            out["claimed"]["output_digest"],
+            out["replayed"]["output_digest"]
+        );
+        assert_eq!(out["observations"], json!(["ci:status"]));
+    }
+
+    /// A replay that disagrees with what was claimed must say so, not just
+    /// report a mismatch silently in a field nobody checks.
+    #[test]
+    fn attestation_verify_catches_a_claim_that_does_not_replay() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        // Attested "holds" while its embedded observation says "red" — the
+        // falsifier will actually replay to "fails".
+        let mut probe = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "prober",
+            "green",
+            "prover",
+            at,
+        );
+        let (sk, _) = keys("prober");
+
+        // The attestor swaps what it embeds (red) but leaves the outcome/digest
+        // tags at what running against "green" actually produced. Update the
+        // observations-tag digest to match the new content, so this is a
+        // *replay* mismatch, not the separate self-consistency check.
+        let mut content: Value = serde_json::from_str(probe["content"].as_str().unwrap()).unwrap();
+        content["observations"]["ci:status"] = json!(base64_encode(b"red"));
+        probe["content"] = json!(serde_json::to_string(&content).unwrap());
+
+        let mut new_observations = crucible_core::attestation::Observations::new();
+        new_observations.insert("ci:status".to_string(), b"red".to_vec());
+        let new_obs_digest = hex::encode(crucible_core::attestation::observations_digest(
+            &new_observations,
+        ));
+        let tags = probe["tags"].as_array_mut().unwrap();
+        for t in tags.iter_mut() {
+            if t[0] == "observations" {
+                t[1] = json!(new_obs_digest);
+            }
+        }
+        let probe = sign(&probe, &sk);
+
+        let out = attestation_verify(&json!({
+            "event": probe, "manifest": manifest(), "module_path": CI_GREEN,
+            "inputs": {"sha": "deadbeef"},
+        }))
+        .unwrap();
+        assert_eq!(out["verified"], json!(false));
+        assert_eq!(out["claimed"]["outcome"], json!("holds"));
+        assert_eq!(out["replayed"]["outcome"], json!("fails"));
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// An attestation whose `observations` tag does not match what it actually
+    /// embedded is self-inconsistent and must be refused before any replay is
+    /// attempted — otherwise a dishonest attestor could publish a digest that
+    /// matches nothing it shipped and rely on a lazy verifier never checking.
+    #[test]
+    fn a_tag_digest_that_does_not_match_embedded_content_is_refused() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let mut probe = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "prober",
+            "green",
+            "prover",
+            at,
+        );
+        let (sk, _) = keys("prober");
+        let tags = probe["tags"].as_array_mut().unwrap();
+        for t in tags.iter_mut() {
+            if t[0] == "observations" {
+                t[1] = json!("ff".repeat(32));
+            }
+        }
+        let probe = sign(&probe, &sk);
+
+        let err = attestation_verify(&json!({
+            "event": probe, "manifest": manifest(), "module_path": CI_GREEN,
+            "inputs": {"sha": "deadbeef"},
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match"), "got {err}");
+    }
+
+    /// Verifying against the wrong claim's inputs must not silently "work" —
+    /// it names a different experiment than the one the attestor actually ran.
+    #[test]
+    fn attestation_verify_refuses_a_mismatched_experiment() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let probe = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "prober",
+            "green",
+            "prover",
+            at,
+        );
+
+        let err = attestation_verify(&json!({
+            "event": probe, "manifest": manifest(), "module_path": CI_GREEN,
+            "inputs": {"sha": "some-other-commit"},
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a replay"), "got {err}");
     }
 
     /// A missing roster is the difference between a demo and a deployment, and
