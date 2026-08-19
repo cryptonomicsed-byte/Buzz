@@ -11,8 +11,8 @@ use crate::independence::{discount, Contributor};
 use crate::policy::Policy;
 use crucible_core::attestation::Provenance;
 use crucible_core::{
-    Attestation, Challenge, Claim, Commitment, EventId, Outcome, ProvenanceAttestation, PubKey,
-    Status, Timestamp, Verdict,
+    Attestation, Challenge, Claim, Commitment, EventId, OracleVerdict, Outcome,
+    ProvenanceAttestation, PubKey, Status, Timestamp, Verdict,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,10 @@ pub struct Resolution {
     pub output_digests: Vec<String>,
     /// Challenges outstanding against this claim. Visible, but not evidence.
     pub open_challenges: usize,
+    /// The oracle whose verdict settled `status`, when one did. `None` means
+    /// `status` came from the ordinary independence-weighted aggregate —
+    /// either no oracle is configured, or none spoke for this claim.
+    pub oracle: Option<PubKey>,
 }
 
 fn sigmoid(x: f64) -> f64 {
@@ -239,6 +243,7 @@ pub fn resolve(
     challenges: &[Challenge],
     commitments: &[Commitment],
     provenance_attestations: &[ProvenanceAttestation],
+    oracle_verdicts: &[OracleVerdict],
     ledger: &Ledger,
     policy: &Policy,
     now: Timestamp,
@@ -462,7 +467,22 @@ pub fn resolve(
     let log_odds = support - opposition;
     let mass = sigmoid(log_odds);
 
-    let status = if in_effect {
+    let oracle_verdict = if in_effect {
+        find_oracle_verdict(claim, oracle_verdicts, policy, now)
+    } else {
+        None
+    };
+    let status = if let Some(ov) = oracle_verdict {
+        // An authoritative, exogenous answer settles status outright, ahead
+        // of the aggregate machinery entirely — including `nondeterministic`.
+        // A broken falsifier means the *experiment* cannot be trusted; it says
+        // nothing about whether the oracle's independent answer is correct.
+        match ov.outcome {
+            Outcome::Holds => Status::Supported,
+            Outcome::Fails => Status::Refuted,
+            Outcome::Indeterminate => unreachable!("find_oracle_verdict excludes these"),
+        }
+    } else if in_effect {
         decide(
             claim,
             policy,
@@ -502,7 +522,31 @@ pub fn resolve(
         contributions,
         excluded,
         output_digests: digests,
+        oracle: oracle_verdict.map(|ov| ov.oracle),
     }
+}
+
+/// The most recent valid oracle verdict for `claim`, if any. "Valid" means:
+/// signed by a key `policy.oracle_authorities` names, about this claim's
+/// exact experiment, not dated beyond the community's clock-skew bound, and
+/// not itself `Indeterminate` — an oracle that declines to answer settles
+/// nothing, the same way an indeterminate probe carries no evidence.
+fn find_oracle_verdict<'a>(
+    claim: &Claim,
+    oracle_verdicts: &'a [OracleVerdict],
+    policy: &Policy,
+    now: Timestamp,
+) -> Option<&'a OracleVerdict> {
+    policy.oracle_authorities.as_ref()?;
+    let experiment = claim.falsifier.experiment_id();
+    oracle_verdicts
+        .iter()
+        .filter(|ov| ov.claim == claim.id)
+        .filter(|ov| ov.experiment == experiment)
+        .filter(|ov| policy.is_oracle_authority(&ov.oracle))
+        .filter(|ov| ov.outcome != Outcome::Indeterminate)
+        .filter(|ov| ov.created_at <= now.saturating_add(policy.max_clock_skew))
+        .max_by_key(|ov| ov.created_at)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -234,6 +234,23 @@ and check the replayed outcome matches — an observational attestation is no
 longer "trust me," it is independently replayable by anyone holding the
 falsifier module.
 
+A sixth pass closed the deepest of the six: `settle` scored every agent
+against `resolve`'s own verdict, which by default is nothing but an
+aggregate of those same agents' reports — a colluding majority was correct
+by construction, and honest disagreement was indistinguishable from a
+minority being penalised for being right. `Policy::oracle_authorities` names
+keys trusted to hand down an authoritative `kind:47010` answer
+(`crucible oracle.verdict`) for a claim's experiment; when one exists,
+`resolve` lets it override `status` outright, ahead of the aggregate
+machinery entirely, and `settle` inherits the override automatically — every
+attestor's forecast (and the claim author's own) is then scored against the
+oracle's answer, not against their own consensus. `None` by default, so a
+community with no such source sees no behaviour change, and even with an
+oracle configured a claim with no oracle verdict for it still resolves from
+the ordinary aggregate — this is a soft upgrade, not a requirement that every
+claim wait on the oracle to speak. See
+`tests::settle_scores_attestors_against_the_oracle_not_their_own_consensus`.
+
 What follows is what remains true.
 
 - **Sybil resistance is inherited, not provided.** With no roster configured,
@@ -242,9 +259,14 @@ What follows is what remains true.
   plugs in, and a deployment without one is a demo. Attested provenance closes
   the "how independent do these three keys look" question; it does not answer
   "should these three keys be heard at all" — that is still roster's job.
-- **There is no exogenous ground truth.** `settle` scores agents against the
-  kernel's own verdict, which is a function of their reports. That measures
-  conformity, and a colluding majority is correct by construction.
+- **Exogenous ground truth requires a community to actually name one.** With
+  no `oracle_authorities` configured — the default — `settle` still scores
+  every agent against the kernel's own aggregate verdict, and the circularity
+  named above is exactly as present as it always was. The oracle seam does
+  not manufacture ground truth from nothing: it only helps once a community
+  points it at a real one, and nothing stops that key from being wrong, or
+  from being misconfigured to also attest on the claims it oracles, which
+  would defeat the point.
 - **Nothing binds the natural-language statement to the falsifier's
   correctness.** Content addressing proves two agents ran the same bytes; it
   proves nothing about whether those bytes check what the statement claims.

@@ -10,8 +10,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crucible_core::attestation::{observations_digest, AttestationContent, Provenance};
 use crucible_core::claim::{ClaimBody, FalsifierRef};
 use crucible_core::{
-    kinds, Attestation, Challenge, Claim, Commitment, EventId, NostrEvent, ProvenanceAttestation,
-    PubKey, Signature, Timestamp,
+    kinds, Attestation, Challenge, Claim, Commitment, EventId, NostrEvent, OracleVerdict,
+    ProvenanceAttestation, PubKey, Signature, Timestamp,
 };
 use crucible_kernel::{resolve, settle, Ledger, Policy};
 use crucible_probe::{audit_vacuity, Falsifier, Manifest, Observations};
@@ -556,6 +556,46 @@ pub fn provenance_attest(input: &Value) -> Result<Value> {
     }))
 }
 
+/// Build a community oracle's authoritative answer for a claim (`kind:47010`).
+///
+/// Signed by the oracle, never by an attestor or the claimant: this is what
+/// makes it exogenous rather than yet another self-report from the population
+/// `settle` scores. Only meaningful once `Policy::oracle_authorities` names
+/// this key — see [docs/BUZZ.md](../../docs/BUZZ.md#what-an-operator-has-to-decide).
+pub fn oracle_verdict(input: &Value) -> Result<Value> {
+    let oracle = pubkey(input, "pubkey")?;
+    let created_at = field(input, "created_at")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("created_at must be a unix timestamp"))?;
+    let claim =
+        EventId::parse_hex(str_field(input, "claim")?).map_err(|e| anyhow!("claim: {e}"))?;
+    let experiment = hex::decode(str_field(input, "experiment")?)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or_else(|| anyhow!("experiment must be a 32-byte hex digest"))?;
+    let outcome = crucible_core::Outcome::parse(str_field(input, "outcome")?)
+        .ok_or_else(|| anyhow!("outcome must be holds, fails or indeterminate"))?;
+
+    let ov = crucible_core::OracleVerdict {
+        id: EventId::from_bytes([0; 32]),
+        oracle,
+        created_at,
+        claim,
+        experiment,
+        outcome,
+    };
+
+    Ok(json!({
+        "event": unsigned(
+            &oracle,
+            kinds::ORACLE_VERDICT,
+            created_at,
+            ov.to_unsigned_tags(),
+            String::new(),
+        ),
+    }))
+}
+
 /// Check whether a pure falsifier actually depends on its declared inputs.
 ///
 /// `claim.build` already refuses a vacuous pure falsifier; this verb exists so
@@ -641,6 +681,7 @@ struct Gathered {
     challenges: Vec<Challenge>,
     commitments: Vec<Commitment>,
     provenance_attestations: Vec<ProvenanceAttestation>,
+    oracle_verdicts: Vec<OracleVerdict>,
     rejected: Vec<Value>,
 }
 
@@ -681,6 +722,7 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
     let mut challenges = Vec::new();
     let mut commitments = Vec::new();
     let mut provenance_attestations = Vec::new();
+    let mut oracle_verdicts = Vec::new();
     for ev in &valid {
         match ev.kind {
             kinds::ATTESTATION => match Attestation::from_event(ev) {
@@ -705,6 +747,11 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
                 Ok(pa) => provenance_attestations.push(pa),
                 Err(e) => rejected.push(json!({"id": ev.id.to_hex(), "reason": e.to_string()})),
             },
+            kinds::ORACLE_VERDICT => match OracleVerdict::from_event(ev) {
+                Ok(ov) if ov.claim == claim.id => oracle_verdicts.push(ov),
+                Ok(_) => {}
+                Err(e) => rejected.push(json!({"id": ev.id.to_hex(), "reason": e.to_string()})),
+            },
             _ => {}
         }
     }
@@ -715,6 +762,7 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
         challenges,
         commitments,
         provenance_attestations,
+        oracle_verdicts,
         rejected,
     })
 }
@@ -788,6 +836,7 @@ pub fn resolve_verb(input: &Value) -> Result<Value> {
         &g.challenges,
         &g.commitments,
         &g.provenance_attestations,
+        &g.oracle_verdicts,
         &ledger,
         &policy,
         now,
@@ -863,6 +912,7 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
             &g.challenges,
             &g.commitments,
             &g.provenance_attestations,
+            &g.oracle_verdicts,
             &ledger,
             &policy,
             now,
@@ -1085,6 +1135,11 @@ pub fn tools() -> Value {
                 "input": {"event": "signed attestation event", "manifest": "manifest", "module_path|module_hex": "wasm or .wat", "inputs": "the claim's declared inputs, json"},
             },
             {
+                "name": "oracle.verdict",
+                "summary": "Build a community oracle's authoritative, exogenous answer for a claim, so settle() can score attestors against something other than their own aggregate. Only meaningful once Policy::oracle_authorities names this key.",
+                "input": {"pubkey": "hex — the oracle", "created_at": "unix", "claim": "hex", "experiment": "hex", "outcome": "holds|fails|indeterminate"},
+            },
+            {
                 "name": "falsifier.audit",
                 "summary": "Check whether a pure falsifier's outcome actually depends on its declared inputs, by running it against structural mutations of them. A module that never moves is a constant wearing a falsifier's shape. claim.build runs this automatically and refuses a vacuous one; call it standalone to check a module before committing to a claim.",
                 "input": {"manifest": "manifest", "module_path|module_hex": "wasm or .wat", "inputs": "json?", "observations": "{key: string}?"},
@@ -1135,6 +1190,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
         "attestation.verify" => attestation_verify(input),
         "blind.commit" => blind_commit(input),
         "provenance.attest" => provenance_attest(input),
+        "oracle.verdict" => oracle_verdict(input),
         "resolve" => resolve_verb(input),
         "ledger.replay" => ledger_replay(input),
         "event.verify" => event_verify(input),
@@ -2263,5 +2319,140 @@ mod falsifier_vacuity {
         .unwrap();
         assert_eq!(out["applicable"], json!(false));
         assert_eq!(out["vacuous"], json!(false));
+    }
+}
+
+#[cfg(test)]
+mod exogenous_ground_truth {
+    use super::tests::*;
+    use super::*;
+
+    fn probes(claim: &Value, experiment: &str, digest: &str, at: u64) -> Vec<Value> {
+        ["goose", "codex", "opus"]
+            .iter()
+            .enumerate()
+            .map(|(i, m)| a_probe(claim, experiment, digest, m, "green", m, at + 10 * i as u64))
+            .collect()
+    }
+
+    /// Three genuinely independent attestors unanimously call it `holds`; on
+    /// the room's own aggregate alone that is `Supported`. A trusted oracle
+    /// saying `fails` overrides that verdict outright — the whole point of
+    /// naming an oracle is that it does not have to out-vote the population.
+    #[test]
+    fn a_trusted_oracle_overrides_three_agreeing_attestors_end_to_end() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let claim_id = claim["id"].as_str().unwrap().to_string();
+        let events: Vec<Value> = std::iter::once(claim.clone())
+            .chain(probes(&claim, &experiment, &digest, at))
+            .collect();
+
+        // Without an oracle, the same events resolve `Supported`.
+        let baseline = resolve_verb(&json!({
+            "events": events.clone(), "now": at + 60, "policy": open(),
+        }))
+        .unwrap();
+        assert_eq!(
+            baseline["resolution"]["verdict"]["status"],
+            json!("supported")
+        );
+
+        let (oracle_sk, oracle_pk) = keys("oracle");
+        let ov = sign(
+            &oracle_verdict(&json!({
+                "pubkey": oracle_pk, "created_at": at,
+                "claim": claim_id, "experiment": experiment, "outcome": "fails",
+            }))
+            .unwrap()["event"],
+            &oracle_sk,
+        );
+        let mut with_oracle_events = events;
+        with_oracle_events.push(ov);
+
+        let policy = json!({"allow_unrostered": true, "oracle_authorities": [oracle_pk]});
+        let out = resolve_verb(&json!({
+            "events": with_oracle_events, "now": at + 60, "policy": policy,
+        }))
+        .unwrap();
+        assert_eq!(
+            out["resolution"]["verdict"]["status"],
+            json!("refuted"),
+            "a trusted oracle must override three agreeing attestors"
+        );
+        assert_eq!(out["resolution"]["oracle"], json!(oracle_pk));
+    }
+
+    /// The property that closes the circularity, exercised through the real
+    /// replay path: the same three unanimous `holds` attestations are scored
+    /// against the room's own aggregate in one replay and against a trusted
+    /// oracle's contrary answer in another, and every attestor must come out
+    /// worse off in the second — `settle` no longer just measures agreement
+    /// with the crowd.
+    #[test]
+    fn ledger_replay_settles_attestors_against_the_oracle_not_the_crowd() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let claim_id = claim["id"].as_str().unwrap().to_string();
+        let events: Vec<Value> = std::iter::once(claim.clone())
+            .chain(probes(&claim, &experiment, &digest, at))
+            .collect();
+
+        let rewarded = ledger_replay(&json!({
+            "events": events.clone(), "now": at + 60, "policy": open(),
+        }))
+        .unwrap();
+        assert_eq!(rewarded["verdicts"][0]["status"], json!("supported"));
+
+        let (oracle_sk, oracle_pk) = keys("oracle");
+        let ov = sign(
+            &oracle_verdict(&json!({
+                "pubkey": oracle_pk, "created_at": at,
+                "claim": claim_id, "experiment": experiment, "outcome": "fails",
+            }))
+            .unwrap()["event"],
+            &oracle_sk,
+        );
+        let mut with_oracle_events = events;
+        with_oracle_events.push(ov);
+        let policy = json!({"allow_unrostered": true, "oracle_authorities": [oracle_pk]});
+        let penalised = ledger_replay(&json!({
+            "events": with_oracle_events, "now": at + 60, "policy": policy,
+        }))
+        .unwrap();
+        assert_eq!(penalised["verdicts"][0]["status"], json!("refuted"));
+
+        let weight_of = |report: &Value, seed: &str| {
+            let (_, pk) = keys(seed);
+            report["calibration"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["agent"] == json!(pk))
+                .unwrap_or_else(|| panic!("no calibration entry for {seed}"))["weight"]
+                .as_f64()
+                .unwrap()
+        };
+        for seed in ["goose", "codex", "opus"] {
+            let rewarded_weight = weight_of(&rewarded, seed);
+            let penalised_weight = weight_of(&penalised, seed);
+            assert!(
+                penalised_weight < rewarded_weight,
+                "{seed} must be scored against the oracle, not the crowd it agreed with: \
+                 rewarded={rewarded_weight}, penalised={penalised_weight}"
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_verdict_refuses_an_experiment_that_is_not_valid_hex() {
+        let (_, oracle_pk) = keys("oracle");
+        let err = oracle_verdict(&json!({
+            "pubkey": oracle_pk, "created_at": 1_700_000_000,
+            "claim": "11".repeat(32), "experiment": "not-hex", "outcome": "holds",
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("experiment"), "got {err}");
     }
 }

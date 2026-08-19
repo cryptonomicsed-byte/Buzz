@@ -110,6 +110,22 @@ pub struct Policy {
     /// the flag on — floors every attestor's provenance; set both together.
     pub provenance_authorities: Option<BTreeSet<PubKey>>,
 
+    /// Keys trusted to hand down an authoritative, exogenous answer for a
+    /// claim (`kind:47010`), bypassing the independence-weighted aggregate.
+    ///
+    /// `settle` scoring agents against `resolve`'s own verdict is circular
+    /// whenever that verdict is purely a function of the same agents'
+    /// reports: a colluding majority is correct by construction. A key here
+    /// is not a witness contributing to the aggregate — it is a resolution
+    /// source outside the population being scored, the same way a prediction
+    /// market's forecasters are scored against a source that is not itself
+    /// one of the forecasters. `None` (the default) means no oracle exists
+    /// for this community and every claim resolves and settles exactly as it
+    /// always did. Populating it does not require every claim to wait for an
+    /// oracle: absent a valid oracle verdict for a given claim, resolution
+    /// falls back to the ordinary aggregate.
+    pub oracle_authorities: Option<BTreeSet<PubKey>>,
+
     /// Calibration domains this community recognises.
     ///
     /// The domain is chosen by the claim's *author*, and reliability is keyed on
@@ -145,6 +161,7 @@ impl Default for Policy {
             require_verified_blind: false,
             require_attested_provenance: false,
             provenance_authorities: None,
+            oracle_authorities: None,
             domains: None,
         }
     }
@@ -179,6 +196,13 @@ impl Policy {
         self.provenance_authorities
             .as_ref()
             .is_some_and(|a| a.contains(authority))
+    }
+
+    /// Whether `oracle` is trusted to hand down an authoritative verdict.
+    pub fn is_oracle_authority(&self, oracle: &PubKey) -> bool {
+        self.oracle_authorities
+            .as_ref()
+            .is_some_and(|a| a.contains(oracle))
     }
 
     /// Reject a policy that cannot mean anything, so a bad config fails at load

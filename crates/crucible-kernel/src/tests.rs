@@ -10,7 +10,9 @@ use crate::policy::Policy;
 use crate::resolve::{resolve, settle, Role};
 use crucible_core::attestation::Provenance;
 use crucible_core::claim::{ClaimBody, FalsifierRef};
-use crucible_core::{Attestation, Challenge, Claim, EventId, Outcome, PubKey, Status};
+use crucible_core::{
+    Attestation, Challenge, Claim, EventId, OracleVerdict, Outcome, PubKey, Status,
+};
 
 const T0: u64 = 1_700_000_000;
 const HALF_LIFE: u64 = 900;
@@ -155,7 +157,17 @@ fn resolve_at(
     ledger: &Ledger,
     now: u64,
 ) -> crate::resolve::Resolution {
-    resolve(claim, probes, &[], &[], &[], ledger, &open_policy(), now)
+    resolve(
+        claim,
+        probes,
+        &[],
+        &[],
+        &[],
+        &[],
+        ledger,
+        &open_policy(),
+        now,
+    )
 }
 
 // ---------------------------------------------------------------- independence
@@ -765,6 +777,7 @@ fn a_stricter_policy_demands_more_witnesses() {
         &[],
         &[],
         &[],
+        &[],
         &Ledger::new(),
         &Policy {
             allow_unrostered: true,
@@ -946,6 +959,7 @@ fn a_challenge_does_not_move_belief_by_itself() {
         &challenges,
         &[],
         &[],
+        &[],
         &Ledger::new(),
         &open_policy(),
         T0,
@@ -1048,7 +1062,17 @@ fn attestors_outside_the_roster_are_excluded_with_a_reason() {
         roster: Some([key(200), key(1), key(2)].into_iter().collect()),
         ..open_policy()
     };
-    let closed = resolve(&claim, &sybils, &[], &[], &[], &Ledger::new(), &policy, T0);
+    let closed = resolve(
+        &claim,
+        &sybils,
+        &[],
+        &[],
+        &[],
+        &[],
+        &Ledger::new(),
+        &policy,
+        T0,
+    );
     assert_eq!(closed.verdict.attestations, 2);
     assert_eq!(closed.excluded.len(), 3);
     assert!(closed.excluded[0].reason.contains("roster"));
@@ -1067,7 +1091,7 @@ fn an_unadmitted_author_carries_no_weight_of_its_own() {
         roster: Some([key(1)].into_iter().collect()),
         ..open_policy()
     };
-    let r = resolve(&claim, &[], &[], &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &[], &[], &[], &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.mass, 0.5);
     assert_eq!(r.verdict.support, 0.0);
 }
@@ -1090,7 +1114,7 @@ fn a_domain_the_community_does_not_recognise_earns_the_author_nothing() {
         ),
         ..open_policy()
     };
-    let r = resolve(&claim, &[], &[], &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &[], &[], &[], &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.support, 0.0);
 }
 
@@ -1116,6 +1140,7 @@ fn attestations_beyond_the_cap_are_dropped_oldest_first() {
     let r = resolve(
         &claim,
         &flood,
+        &[],
         &[],
         &[],
         &[],
@@ -1250,7 +1275,7 @@ fn an_absurd_half_life_is_clamped_and_reported() {
 
     let policy = open_policy();
     let far = T0 + policy.max_half_life * 60;
-    let r = resolve(&forever, &probes, &[], &[], &[], &ledger, &policy, far);
+    let r = resolve(&forever, &probes, &[], &[], &[], &[], &ledger, &policy, far);
 
     assert_eq!(r.verdict.status, Status::Decayed);
     assert!(
@@ -1286,7 +1311,17 @@ fn settlement_scores_only_what_the_verdict_counted() {
         ..Policy::default()
     };
     let mut ledger = Ledger::new();
-    let r = resolve(&claim, &probes, &[], &[], &[], &ledger, &policy, T0 + 60);
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &[],
+        &ledger,
+        &policy,
+        T0 + 60,
+    );
     assert_eq!(r.verdict.status, Status::Supported);
     assert_eq!(r.verdict.attestations, 4);
     assert_eq!(r.excluded.len(), 2);
@@ -1349,7 +1384,7 @@ fn an_unadmitted_challenger_is_not_scored() {
     };
 
     let mut ledger = Ledger::new();
-    let r = resolve(&claim, &probes, &[], &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &probes, &[], &[], &[], &[], &ledger, &policy, T0);
     settle(
         &mut ledger,
         &claim,
@@ -1432,6 +1467,7 @@ fn a_valid_early_commitment_preserves_blind_credit() {
         &[],
         &[c1, c2],
         &[],
+        &[],
         &Ledger::new(),
         &policy,
         T0 + 11,
@@ -1473,7 +1509,17 @@ fn an_unbacked_claim_of_blindness_is_downgraded_when_verification_is_required() 
         .collect();
 
     let policy = rostered_verified_blind_policy();
-    let r = resolve(&claim, &probes, &[], &[], &[], &Ledger::new(), &policy, T0);
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &[],
+        &Ledger::new(),
+        &policy,
+        T0,
+    );
     assert!(
         r.verdict.n_eff < 2.0,
         "unbacked blind claims must lose credit once proof is required, got {}",
@@ -1499,6 +1545,7 @@ fn a_late_commitment_does_not_prove_blindness() {
         &[a1, a2],
         &[],
         &[c2],
+        &[],
         &[],
         &Ledger::new(),
         &policy,
@@ -1531,6 +1578,7 @@ fn a_commitment_that_does_not_match_the_reveal_does_not_count() {
         &[a1, a2],
         &[],
         &[c1, c2],
+        &[],
         &[],
         &Ledger::new(),
         &policy,
@@ -1598,6 +1646,7 @@ fn unbacked_distinct_provenance_is_floored_under_a_strict_policy() {
         &[],
         &[],
         &[],
+        &[],
         &Ledger::new(),
         &provenance_authority_policy(),
         T0,
@@ -1639,6 +1688,7 @@ fn attested_provenance_keeps_full_credit() {
         &[],
         &[],
         &vouches,
+        &[],
         &Ledger::new(),
         &provenance_authority_policy(),
         T0,
@@ -1668,6 +1718,7 @@ fn a_vouch_from_an_untrusted_authority_does_not_count() {
         &[],
         &[],
         &vouches,
+        &[],
         &Ledger::new(),
         &provenance_authority_policy(),
         T0,
@@ -1694,6 +1745,7 @@ fn an_expired_vouch_does_not_count() {
         &[],
         &[],
         &vouches,
+        &[],
         &Ledger::new(),
         &provenance_authority_policy(),
         T0,
@@ -1729,6 +1781,7 @@ fn a_vouch_for_different_provenance_than_declared_does_not_count() {
         &[],
         &[],
         &vouches,
+        &[],
         &Ledger::new(),
         &provenance_authority_policy(),
         T0,
@@ -1737,4 +1790,271 @@ fn a_vouch_for_different_provenance_than_declared_does_not_count() {
         r.verdict.n_eff < 2.0,
         "a mismatched vouch must not transfer"
     );
+}
+
+// ------------------------------------------------------------ exogenous ground truth
+
+fn oracle_policy() -> Policy {
+    Policy {
+        allow_unrostered: true,
+        oracle_authorities: Some([key(250)].into_iter().collect()),
+        ..Policy::default()
+    }
+}
+
+fn oracle_says(claim: &Claim, outcome: Outcome, created_at: u64) -> OracleVerdict {
+    OracleVerdict {
+        id: id(251),
+        oracle: key(250),
+        created_at,
+        claim: claim.id,
+        experiment: claim.falsifier.experiment_id(),
+        outcome,
+    }
+}
+
+/// The headline property: with no oracle verdict at all, the room's own
+/// aggregate settles the claim exactly as it always did — the mechanism does
+/// not change any default behaviour.
+#[test]
+fn no_oracle_configured_resolves_exactly_as_before() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &[],
+        &Ledger::new(),
+        &open_policy(),
+        T0,
+    );
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert_eq!(r.oracle, None);
+}
+
+/// A minority of probes says `fails`; on the aggregate alone the claim would
+/// still read `Supported`. A trusted oracle saying otherwise overrides the
+/// aggregate entirely — this is the whole point: an oracle's answer does not
+/// have to out-vote the population, because it is not part of the population.
+#[test]
+fn a_trusted_oracle_overrides_the_aggregate() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let oracle_verdicts = [oracle_says(&claim, Outcome::Fails, T0)];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &oracle_verdicts,
+        &Ledger::new(),
+        &oracle_policy(),
+        T0,
+    );
+    assert_eq!(
+        r.verdict.status,
+        Status::Refuted,
+        "an authoritative oracle must override ten agreeing probes"
+    );
+    assert_eq!(r.oracle, Some(key(250)));
+}
+
+/// An oracle verdict from a key the policy does not name is not an oracle —
+/// it is just another unbacked assertion, and must not move status at all.
+#[test]
+fn an_untrusted_oracle_is_ignored() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let impostor = OracleVerdict {
+        id: id(251),
+        oracle: key(251),
+        created_at: T0,
+        claim: claim.id,
+        experiment: claim.falsifier.experiment_id(),
+        outcome: Outcome::Fails,
+    };
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &[impostor],
+        &Ledger::new(),
+        &oracle_policy(),
+        T0,
+    );
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert_eq!(r.oracle, None);
+}
+
+/// An oracle verdict about a different experiment must not settle this claim
+/// — the same "same experiment" discipline every other cross-check in the
+/// kernel already enforces.
+#[test]
+fn an_oracle_verdict_for_a_different_experiment_does_not_count() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let mismatched = OracleVerdict {
+        id: id(251),
+        oracle: key(250),
+        created_at: T0,
+        claim: claim.id,
+        experiment: [9; 32],
+        outcome: Outcome::Fails,
+    };
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &[mismatched],
+        &Ledger::new(),
+        &oracle_policy(),
+        T0,
+    );
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert_eq!(r.oracle, None);
+}
+
+/// An `Indeterminate` oracle abstains — it settles nothing, and the aggregate
+/// governs exactly as if no oracle verdict existed.
+#[test]
+fn an_indeterminate_oracle_abstains() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let abstention = [oracle_says(&claim, Outcome::Indeterminate, T0)];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &abstention,
+        &Ledger::new(),
+        &oracle_policy(),
+        T0,
+    );
+    assert_eq!(r.verdict.status, Status::Supported);
+    assert_eq!(r.oracle, None);
+}
+
+/// Two oracle verdicts on the same claim — the oracle changed its mind. The
+/// most recent one governs, the same way a later attestation supersedes an
+/// agent's own earlier one.
+#[test]
+fn the_most_recent_oracle_verdict_governs() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let history = [
+        oracle_says(&claim, Outcome::Holds, T0),
+        oracle_says(&claim, Outcome::Fails, T0 + 60),
+    ];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &history,
+        &Ledger::new(),
+        &oracle_policy(),
+        T0 + 60,
+    );
+    assert_eq!(r.verdict.status, Status::Refuted);
+}
+
+/// The property that actually closes the circularity. Ten agents unanimously
+/// attest `holds`, over the same claim, in two worlds that differ only in
+/// whether an oracle spoke. Without one, the room's own aggregate says
+/// `Supported` and `settle` rewards every attestor for agreeing with
+/// themselves — the circularity named in the review. With a trusted oracle
+/// saying `fails`, the same ten unanimous attestations are scored against
+/// *that* instead, and every one of them must come out worse off, not
+/// better, for having unanimously called it wrong.
+#[test]
+fn settle_scores_attestors_against_the_oracle_not_their_own_consensus() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=10)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+
+    let without_oracle = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &[],
+        &Ledger::new(),
+        &open_policy(),
+        T0,
+    );
+    assert_eq!(without_oracle.verdict.status, Status::Supported);
+    let mut rewarded = Ledger::new();
+    assert!(settle(
+        &mut rewarded,
+        &claim,
+        &probes,
+        &[],
+        &without_oracle.verdict,
+        &open_policy(),
+    ));
+
+    let oracle_verdicts = [oracle_says(&claim, Outcome::Fails, T0)];
+    let policy = oracle_policy();
+    let with_oracle = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &oracle_verdicts,
+        &Ledger::new(),
+        &policy,
+        T0,
+    );
+    assert_eq!(with_oracle.verdict.status, Status::Refuted);
+    let mut penalised = Ledger::new();
+    assert!(settle(
+        &mut penalised,
+        &claim,
+        &probes,
+        &[],
+        &with_oracle.verdict,
+        &policy,
+    ));
+
+    for n in 1..=10u8 {
+        let rewarded_weight = rewarded.weight(&key(n), &claim.domain);
+        let penalised_weight = penalised.weight(&key(n), &claim.domain);
+        assert!(
+            penalised_weight < rewarded_weight,
+            "attestor {n} must be scored against the oracle, not its own unanimous \
+             consensus: rewarded={rewarded_weight}, penalised={penalised_weight}"
+        );
+    }
 }

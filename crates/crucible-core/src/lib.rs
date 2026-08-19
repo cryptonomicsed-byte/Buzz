@@ -22,6 +22,7 @@ pub mod error;
 pub mod event;
 pub mod ids;
 pub mod kinds;
+pub mod oracle_verdict;
 pub mod provenance_attestation;
 pub mod verdict;
 
@@ -32,6 +33,7 @@ pub use commitment::{commitment_hash, Commitment};
 pub use error::{Error, Result};
 pub use event::{NostrEvent, Tag};
 pub use ids::{EventId, PubKey, Signature};
+pub use oracle_verdict::OracleVerdict;
 pub use provenance_attestation::ProvenanceAttestation;
 pub use verdict::{Status, Verdict};
 

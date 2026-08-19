@@ -247,6 +247,65 @@ extends to whoever runs its admission service or CI identity provider.
 
 ---
 
+## 47010 — oracle verdict
+
+An authoritative answer for a claim's experiment, signed by a key the
+community names as an oracle. This is the seam that closes `settle`'s
+circularity: by default, `resolve`'s verdict — the thing `settle` scores
+every attestor's forecast against — is itself a function of those same
+attestors' reports, so a colluding majority is correct by construction and
+honest disagreement is indistinguishable from a minority being penalised for
+being right. An oracle verdict is exogenous to that population: it does not
+contribute to the independence-weighted aggregate at all, it overrides it.
+
+| Tag | Value |
+| --- | --- |
+| `e` | `[<claim-id>, "", "claim"]` |
+| `experiment` | Must equal the claim's experiment id |
+| `outcome` | `holds` \| `fails` \| `indeterminate` |
+
+`resolve` honours a `kind:47010` event only when signed by a key in
+`Policy::oracle_authorities` (see
+[docs/BUZZ.md](BUZZ.md#what-an-operator-has-to-decide)), about the exact
+experiment the claim declares, not dated beyond `max_clock_skew`, and not
+itself `Indeterminate` — an oracle that declines to answer settles nothing,
+the same way an indeterminate probe carries no evidence. When more than one
+valid oracle verdict exists for a claim, the most recent governs, the same
+way a later attestation supersedes an agent's own earlier one. `None` (the
+default) means no oracle exists for this community, and every claim resolves
+and settles exactly as it always did — this is a soft upgrade, not a new
+requirement: a claim with no oracle verdict still resolves from the ordinary
+aggregate, even in a community that has named oracle authorities.
+
+When an oracle verdict governs, it overrides `status` outright — ahead of
+`nondeterministic`, `decayed`, `insufficient`, everything. A broken falsifier
+means the *experiment* cannot be trusted; it says nothing about whether an
+independent, authoritative answer is correct. `mass`, `n_eff`, `support` and
+`opposition` are left as the ordinary aggregate computed them, so a reader
+can see the room's own belief and the oracle's answer side by side — a gap
+between them is itself a signal worth having, not something to hide.
+`Resolution::oracle` names which key's verdict governed, or `None` when the
+ordinary aggregate did.
+
+`settle` does not read oracle verdicts directly — it always scores against
+`resolve`'s `status`, and now inherits exogeneity from it automatically:
+once an oracle has spoken, every attestor's forecast (and the claim author's
+own) is measured against the oracle's answer, not against their own
+consensus.
+
+What this proves: a key the community already trusts to know the real answer
+independently was willing to sign it. What it cannot prove: that the oracle
+itself is correct — nothing computable from a log can manufacture ground
+truth from nothing. The property that matters is narrower and load-bearing
+anyway: the oracle is not a member of the population its answer scores, the
+same way a prediction market's forecasters are scored against a resolution
+source that is not itself one of the forecasters. Populate this key badly —
+or let it double as an attestor on the claims it also oracles — and the
+seam buys nothing; that discipline is a deployment concern, the same as
+`roster` and `provenance_authorities`.
+
+---
+
 ## 47003 — challenge
 
 | Tag | Value |

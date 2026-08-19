@@ -42,8 +42,13 @@ pub const COMMITMENT: u32 = 47008;
 /// community can require attestation rather than trust self-report.
 pub const PROVENANCE_ATTESTATION: u32 = 47009;
 
+/// A community-designated oracle's authoritative answer for a claim, scored
+/// against nobody and scoring everybody: the exogenous ground truth that lets
+/// `settle` measure agents against something other than their own aggregate.
+pub const ORACLE_VERDICT: u32 = 47010;
+
 /// Every kind Crucible defines, in ascending order.
-pub const ALL: [u32; 9] = [
+pub const ALL: [u32; 10] = [
     CLAIM,
     ATTESTATION,
     CHALLENGE,
@@ -53,6 +58,7 @@ pub const ALL: [u32; 9] = [
     FALSIFIER_MANIFEST,
     COMMITMENT,
     PROVENANCE_ATTESTATION,
+    ORACLE_VERDICT,
 ];
 
 /// The half-open range Crucible reserves. Anything outside it is not ours, and
@@ -76,6 +82,7 @@ pub const fn name(kind: u32) -> Option<&'static str> {
         FALSIFIER_MANIFEST => "falsifier-manifest",
         COMMITMENT => "commitment",
         PROVENANCE_ATTESTATION => "provenance-attestation",
+        ORACLE_VERDICT => "oracle-verdict",
         _ => return None,
     })
 }
