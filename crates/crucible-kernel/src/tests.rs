@@ -155,7 +155,7 @@ fn resolve_at(
     ledger: &Ledger,
     now: u64,
 ) -> crate::resolve::Resolution {
-    resolve(claim, probes, &[], &[], ledger, &open_policy(), now)
+    resolve(claim, probes, &[], &[], &[], ledger, &open_policy(), now)
 }
 
 // ---------------------------------------------------------------- independence
@@ -764,6 +764,7 @@ fn a_stricter_policy_demands_more_witnesses() {
         &probes,
         &[],
         &[],
+        &[],
         &Ledger::new(),
         &Policy {
             allow_unrostered: true,
@@ -944,6 +945,7 @@ fn a_challenge_does_not_move_belief_by_itself() {
         &probes,
         &challenges,
         &[],
+        &[],
         &Ledger::new(),
         &open_policy(),
         T0,
@@ -1046,7 +1048,7 @@ fn attestors_outside_the_roster_are_excluded_with_a_reason() {
         roster: Some([key(200), key(1), key(2)].into_iter().collect()),
         ..open_policy()
     };
-    let closed = resolve(&claim, &sybils, &[], &[], &Ledger::new(), &policy, T0);
+    let closed = resolve(&claim, &sybils, &[], &[], &[], &Ledger::new(), &policy, T0);
     assert_eq!(closed.verdict.attestations, 2);
     assert_eq!(closed.excluded.len(), 3);
     assert!(closed.excluded[0].reason.contains("roster"));
@@ -1065,7 +1067,7 @@ fn an_unadmitted_author_carries_no_weight_of_its_own() {
         roster: Some([key(1)].into_iter().collect()),
         ..open_policy()
     };
-    let r = resolve(&claim, &[], &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &[], &[], &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.mass, 0.5);
     assert_eq!(r.verdict.support, 0.0);
 }
@@ -1088,7 +1090,7 @@ fn a_domain_the_community_does_not_recognise_earns_the_author_nothing() {
         ),
         ..open_policy()
     };
-    let r = resolve(&claim, &[], &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &[], &[], &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.support, 0.0);
 }
 
@@ -1111,7 +1113,16 @@ fn attestations_beyond_the_cap_are_dropped_oldest_first() {
         max_attestations: 10,
         ..open_policy()
     };
-    let r = resolve(&claim, &flood, &[], &[], &Ledger::new(), &policy, T0 + 500);
+    let r = resolve(
+        &claim,
+        &flood,
+        &[],
+        &[],
+        &[],
+        &Ledger::new(),
+        &policy,
+        T0 + 500,
+    );
     assert!(r.verdict.attestations <= 10);
     assert!(r.excluded.iter().any(|e| e.reason.contains("cap")));
 }
@@ -1239,7 +1250,7 @@ fn an_absurd_half_life_is_clamped_and_reported() {
 
     let policy = open_policy();
     let far = T0 + policy.max_half_life * 60;
-    let r = resolve(&forever, &probes, &[], &[], &ledger, &policy, far);
+    let r = resolve(&forever, &probes, &[], &[], &[], &ledger, &policy, far);
 
     assert_eq!(r.verdict.status, Status::Decayed);
     assert!(
@@ -1275,7 +1286,7 @@ fn settlement_scores_only_what_the_verdict_counted() {
         ..Policy::default()
     };
     let mut ledger = Ledger::new();
-    let r = resolve(&claim, &probes, &[], &[], &ledger, &policy, T0 + 60);
+    let r = resolve(&claim, &probes, &[], &[], &[], &ledger, &policy, T0 + 60);
     assert_eq!(r.verdict.status, Status::Supported);
     assert_eq!(r.verdict.attestations, 4);
     assert_eq!(r.excluded.len(), 2);
@@ -1338,7 +1349,7 @@ fn an_unadmitted_challenger_is_not_scored() {
     };
 
     let mut ledger = Ledger::new();
-    let r = resolve(&claim, &probes, &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &probes, &[], &[], &[], &ledger, &policy, T0);
     settle(
         &mut ledger,
         &claim,
@@ -1420,6 +1431,7 @@ fn a_valid_early_commitment_preserves_blind_credit() {
         &[a1, a2],
         &[],
         &[c1, c2],
+        &[],
         &Ledger::new(),
         &policy,
         T0 + 11,
@@ -1461,7 +1473,7 @@ fn an_unbacked_claim_of_blindness_is_downgraded_when_verification_is_required() 
         .collect();
 
     let policy = rostered_verified_blind_policy();
-    let r = resolve(&claim, &probes, &[], &[], &Ledger::new(), &policy, T0);
+    let r = resolve(&claim, &probes, &[], &[], &[], &Ledger::new(), &policy, T0);
     assert!(
         r.verdict.n_eff < 2.0,
         "unbacked blind claims must lose credit once proof is required, got {}",
@@ -1487,6 +1499,7 @@ fn a_late_commitment_does_not_prove_blindness() {
         &[a1, a2],
         &[],
         &[c2],
+        &[],
         &Ledger::new(),
         &policy,
         T0 + 200,
@@ -1518,6 +1531,7 @@ fn a_commitment_that_does_not_match_the_reveal_does_not_count() {
         &[a1, a2],
         &[],
         &[c1, c2],
+        &[],
         &Ledger::new(),
         &policy,
         T0 + 60,
@@ -1525,4 +1539,202 @@ fn a_commitment_that_does_not_match_the_reveal_does_not_count() {
     // Attestor 1's mismatched reveal is downgraded; only attestor 2's blindness
     // is honoured, so this cannot read as two fully independent witnesses.
     assert!(r.verdict.n_eff < 2.0);
+}
+
+// ------------------------------------------------------------ attested provenance
+
+fn provenance_authority_policy() -> Policy {
+    Policy {
+        allow_unrostered: true,
+        require_attested_provenance: true,
+        provenance_authorities: Some([key(250)].into_iter().collect()),
+        ..Policy::default()
+    }
+}
+
+fn vouch(
+    subject: u8,
+    lineage: &str,
+    env: &str,
+    created_at: u64,
+    expires_at: u64,
+) -> crucible_core::ProvenanceAttestation {
+    crucible_core::ProvenanceAttestation {
+        id: id(subject),
+        authority: key(250),
+        created_at,
+        subject: key(subject),
+        lineage: lineage.into(),
+        env: env.into(),
+        expires_at,
+    }
+}
+
+/// Without any policy requiring it, self-reported distinct provenance keeps
+/// full independence credit exactly as it always has — the default must not
+/// change behaviour for a community that never heard of this mechanism.
+#[test]
+fn unattested_provenance_is_unaffected_by_default() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
+    assert!((r.verdict.n_eff - 2.0).abs() < 1e-9);
+}
+
+/// The fix: once a community demands proof, two attestors who merely *typed*
+/// distinct lineage/env strings — free to fabricate — no longer read as fully
+/// independent.
+#[test]
+fn unbacked_distinct_provenance_is_floored_under_a_strict_policy() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &[],
+        &Ledger::new(),
+        &provenance_authority_policy(),
+        T0,
+    );
+    assert!(
+        r.verdict.n_eff < 2.0,
+        "unattested claimed-distinct provenance must be floored, got n_eff={}",
+        r.verdict.n_eff
+    );
+}
+
+/// With a genuine vouch from a trusted authority on both sides, independence
+/// credit is restored — attestation exists precisely to let honest, genuinely
+/// distinct agents prove it.
+#[test]
+fn attested_provenance_keeps_full_credit() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let lineage1 = "model-1";
+    let env1 = "host-1";
+    let lineage2 = "model-2";
+    let env2 = "host-2";
+    let vouches = [
+        // The claim's own author-row provenance also participates in the
+        // correlation pool (it is processed first), so it needs a vouch too —
+        // otherwise its unattested status floors correlation against every
+        // probe that follows it, which is a separate effect from what this
+        // test is isolating.
+        vouch(200, "key:author", "key:author", T0, T0 + 10_000),
+        vouch(1, lineage1, env1, T0, T0 + 10_000),
+        vouch(2, lineage2, env2, T0, T0 + 10_000),
+    ];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &vouches,
+        &Ledger::new(),
+        &provenance_authority_policy(),
+        T0,
+    );
+    assert!(
+        (r.verdict.n_eff - 2.0).abs() < 1e-9,
+        "attested distinct provenance must keep full credit, got n_eff={}",
+        r.verdict.n_eff
+    );
+}
+
+/// A vouch from a key the policy does not name is worth nothing — otherwise
+/// any attestor could vouch for itself.
+#[test]
+fn a_vouch_from_an_untrusted_authority_does_not_count() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let mut rogue = vouch(1, "model-1", "host-1", T0, T0 + 10_000);
+    rogue.authority = key(1); // the attestor vouching for itself
+    let vouches = [rogue, vouch(2, "model-2", "host-2", T0, T0 + 10_000)];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &vouches,
+        &Ledger::new(),
+        &provenance_authority_policy(),
+        T0,
+    );
+    assert!(r.verdict.n_eff < 2.0, "self-vouching must not count");
+}
+
+/// An expired vouch is not honoured — infrastructure changes, and a standing
+/// attestation with no expiry would let stale facts keep paying out forever.
+#[test]
+fn an_expired_vouch_does_not_count() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let vouches = [
+        vouch(1, "model-1", "host-1", T0 - 100, T0 - 1), // already lapsed
+        vouch(2, "model-2", "host-2", T0, T0 + 10_000),
+    ];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &vouches,
+        &Ledger::new(),
+        &provenance_authority_policy(),
+        T0,
+    );
+    assert!(r.verdict.n_eff < 2.0, "an expired vouch must not count");
+}
+
+/// A vouch for a *different* lineage/env than what was actually declared does
+/// not transfer — an attestor cannot borrow another vouch's credibility by
+/// simply matching the subject key.
+#[test]
+fn a_vouch_for_different_provenance_than_declared_does_not_count() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    // Vouches name a lineage/env that does not match what ProbeSpec::independent
+    // actually declared ("model-1"/"host-1", "model-2"/"host-2").
+    let vouches = [
+        vouch(
+            1,
+            "totally-different-model",
+            "totally-different-host",
+            T0,
+            T0 + 10_000,
+        ),
+        vouch(2, "model-2", "host-2", T0, T0 + 10_000),
+    ];
+
+    let r = resolve(
+        &claim,
+        &probes,
+        &[],
+        &[],
+        &vouches,
+        &Ledger::new(),
+        &provenance_authority_policy(),
+        T0,
+    );
+    assert!(
+        r.verdict.n_eff < 2.0,
+        "a mismatched vouch must not transfer"
+    );
 }

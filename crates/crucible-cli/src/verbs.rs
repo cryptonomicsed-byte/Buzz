@@ -10,8 +10,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crucible_core::attestation::{observations_digest, AttestationContent, Provenance};
 use crucible_core::claim::{ClaimBody, FalsifierRef};
 use crucible_core::{
-    kinds, Attestation, Challenge, Claim, Commitment, EventId, NostrEvent, PubKey, Signature,
-    Timestamp,
+    kinds, Attestation, Challenge, Claim, Commitment, EventId, NostrEvent, ProvenanceAttestation,
+    PubKey, Signature, Timestamp,
 };
 use crucible_kernel::{resolve, settle, Ledger, Policy};
 use crucible_probe::{Falsifier, Manifest, Observations};
@@ -497,6 +497,50 @@ pub fn blind_commit(input: &Value) -> Result<Value> {
     }))
 }
 
+/// Build an unsigned provenance attestation (`kind:47009`) — a trusted
+/// authority vouching that `subject` really is `lineage`/`env`.
+///
+/// Signed by the *authority*, not by the subject: this is the whole point.
+/// Self-report is what a subject already provides for free on every claim and
+/// attestation; what closes the gap is a signature from a key the community
+/// already trusts to know infrastructure — an admission service, a CI
+/// identity provider — for a community that has set
+/// `Policy::provenance_authorities` and wants `require_attested_provenance`
+/// to mean something.
+pub fn provenance_attest(input: &Value) -> Result<Value> {
+    let authority = pubkey(input, "pubkey")?;
+    let created_at = field(input, "created_at")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("created_at must be a unix timestamp"))?;
+    let subject = pubkey(input, "subject")?;
+    let expires_at = field(input, "expiry")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("expiry must be a unix timestamp after which this vouch lapses"))?;
+    if expires_at <= created_at {
+        bail!("expiry must be after created_at, or this vouch is dead on arrival");
+    }
+
+    let pa = crucible_core::ProvenanceAttestation {
+        id: EventId::from_bytes([0; 32]),
+        authority,
+        created_at,
+        subject,
+        lineage: str_field(input, "lineage")?.to_string(),
+        env: str_field(input, "env")?.to_string(),
+        expires_at,
+    };
+
+    Ok(json!({
+        "event": unsigned(
+            &authority,
+            kinds::PROVENANCE_ATTESTATION,
+            created_at,
+            pa.to_unsigned_tags(),
+            String::new(),
+        ),
+    }))
+}
+
 /// Announce a falsifier so others can look it up by digest (`kind:47007`).
 ///
 /// Without this, a prober handed a claim knows the module's hash but has no way
@@ -551,6 +595,7 @@ struct Gathered {
     attestations: Vec<Attestation>,
     challenges: Vec<Challenge>,
     commitments: Vec<Commitment>,
+    provenance_attestations: Vec<ProvenanceAttestation>,
     rejected: Vec<Value>,
 }
 
@@ -590,6 +635,7 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
     let mut attestations = Vec::new();
     let mut challenges = Vec::new();
     let mut commitments = Vec::new();
+    let mut provenance_attestations = Vec::new();
     for ev in &valid {
         match ev.kind {
             kinds::ATTESTATION => match Attestation::from_event(ev) {
@@ -607,6 +653,13 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
                 Ok(_) => {}
                 Err(e) => rejected.push(json!({"id": ev.id.to_hex(), "reason": e.to_string()})),
             },
+            // Not claim-scoped: an authority vouches for an agent's provenance
+            // in general, so every valid one in the input is relevant, not
+            // just those naming this claim.
+            kinds::PROVENANCE_ATTESTATION => match ProvenanceAttestation::from_event(ev) {
+                Ok(pa) => provenance_attestations.push(pa),
+                Err(e) => rejected.push(json!({"id": ev.id.to_hex(), "reason": e.to_string()})),
+            },
             _ => {}
         }
     }
@@ -616,6 +669,7 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
         attestations,
         challenges,
         commitments,
+        provenance_attestations,
         rejected,
     })
 }
@@ -688,6 +742,7 @@ pub fn resolve_verb(input: &Value) -> Result<Value> {
         &g.attestations,
         &g.challenges,
         &g.commitments,
+        &g.provenance_attestations,
         &ledger,
         &policy,
         now,
@@ -762,6 +817,7 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
             &g.attestations,
             &g.challenges,
             &g.commitments,
+            &g.provenance_attestations,
             &ledger,
             &policy,
             now,
@@ -969,6 +1025,11 @@ pub fn tools() -> Value {
                 },
             },
             {
+                "name": "provenance.attest",
+                "summary": "Build a trusted authority's vouch for a subject's lineage/env, so a community requiring attested provenance has something to check against instead of self-report alone.",
+                "input": {"pubkey": "hex — the authority", "created_at": "unix", "subject": "hex", "lineage": "string", "env": "string", "expiry": "unix — after this the vouch lapses"},
+            },
+            {
                 "name": "blind.commit",
                 "summary": "Build a commitment to an outcome you have already computed but not yet revealed, so a later blind:true in probe.run's attestation is provable rather than merely asserted. Publish this before reading anyone else's attestation or verdict on the claim.",
                 "input": {"pubkey": "hex", "created_at": "unix", "claim": "hex", "experiment": "hex", "outcome": "holds|fails|indeterminate", "output_digest": "hex", "nonce": "hex, 32 bytes you generated and kept secret"},
@@ -1022,6 +1083,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
         "probe.run" => probe_run(input),
         "attestation.verify" => attestation_verify(input),
         "blind.commit" => blind_commit(input),
+        "provenance.attest" => provenance_attest(input),
         "resolve" => resolve_verb(input),
         "ledger.replay" => ledger_replay(input),
         "event.verify" => event_verify(input),
@@ -1909,5 +1971,150 @@ mod blind_commit_reveal {
         .unwrap_err()
         .to_string();
         assert!(err.contains("nonce"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod provenance_attestation {
+    use super::tests::*;
+    use super::*;
+
+    /// The full round trip: a trusted authority vouches for two attestors'
+    /// lineage/env, both attest, and under a policy that requires attested
+    /// provenance neither loses credit — because both were actually vouched
+    /// for, not just self-declared.
+    #[test]
+    fn a_vouched_pair_keeps_full_credit_under_a_strict_policy() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let (authority_sk, authority_pk) = keys("authority");
+
+        let a1 = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "goose",
+            "green",
+            "goose-model",
+            at,
+        );
+        let a2 = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "codex",
+            "green",
+            "codex-model",
+            at,
+        );
+        let (_, pk1) = keys("goose");
+        let (_, pk2) = keys("codex");
+
+        let vouch = |subject_pk: &str, lineage: &str, env: &str| {
+            let event = provenance_attest(&json!({
+                "pubkey": authority_pk, "created_at": at,
+                "subject": subject_pk, "lineage": lineage,
+                "env": env, "expiry": at + 10_000,
+            }))
+            .unwrap()["event"]
+                .clone();
+            sign(&event, &authority_sk)
+        };
+        let v1 = vouch(&pk1, "goose-model", "host-goose-model");
+        let v2 = vouch(&pk2, "codex-model", "host-codex-model");
+        // The claim author's own provenance row sits in the same correlation
+        // pool as the two attestors, so it needs a vouch too — otherwise its
+        // unattested floor drags down the correlation the pair is measured
+        // against, even though the author row itself never enters n_eff.
+        let author_pk = claim["pubkey"].as_str().unwrap().to_string();
+        let author_lineage = format!("key:{author_pk}");
+        let v0 = vouch(&author_pk, &author_lineage, &author_lineage);
+
+        let out = resolve_verb(&json!({
+            "events": [claim, a1, a2, v0, v1, v2],
+            "now": at,
+            "policy": {
+                "allow_unrostered": true,
+                "require_attested_provenance": true,
+                "provenance_authorities": [authority_pk],
+            },
+        }))
+        .unwrap();
+
+        let n_eff = out["resolution"]["verdict"]["n_eff"].as_f64().unwrap();
+        assert!(
+            (n_eff - 2.0).abs() < 0.01,
+            "two vouched-for, genuinely distinct attestors must keep full credit, got {n_eff}"
+        );
+        assert!(out["resolution"]["excluded"].as_array().unwrap().is_empty());
+    }
+
+    /// The same pair, with no vouch at all, must lose credit once a policy
+    /// actually requires attested provenance — otherwise `require_attested_provenance`
+    /// would be decorative.
+    #[test]
+    fn an_unvouched_pair_is_floored_under_a_strict_policy() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let a1 = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "goose",
+            "green",
+            "goose-model",
+            at,
+        );
+        let a2 = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "codex",
+            "green",
+            "codex-model",
+            at,
+        );
+        let (_, authority_pk) = keys("authority");
+
+        let permissive = resolve_verb(&json!({
+            "events": [claim.clone(), a1.clone(), a2.clone()],
+            "now": at,
+            "policy": {"allow_unrostered": true},
+        }))
+        .unwrap();
+        let strict = resolve_verb(&json!({
+            "events": [claim, a1, a2],
+            "now": at,
+            "policy": {
+                "allow_unrostered": true,
+                "require_attested_provenance": true,
+                "provenance_authorities": [authority_pk],
+            },
+        }))
+        .unwrap();
+
+        let permissive_n = permissive["resolution"]["verdict"]["n_eff"]
+            .as_f64()
+            .unwrap();
+        let strict_n = strict["resolution"]["verdict"]["n_eff"].as_f64().unwrap();
+        assert!(
+            strict_n < permissive_n,
+            "unvouched provenance must lose credit under the strict policy: \
+             permissive={permissive_n}, strict={strict_n}"
+        );
+    }
+
+    #[test]
+    fn provenance_attest_refuses_an_expiry_that_is_not_after_created_at() {
+        let (_, authority_pk) = keys("authority");
+        let (_, subject_pk) = keys("subject");
+        let err = provenance_attest(&json!({
+            "pubkey": authority_pk, "created_at": 1_700_000_000,
+            "subject": subject_pk, "lineage": "goose-model", "env": "host",
+            "expiry": 1_700_000_000,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expiry"), "got {err}");
     }
 }

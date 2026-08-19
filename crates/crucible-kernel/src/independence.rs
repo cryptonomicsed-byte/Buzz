@@ -26,6 +26,19 @@
 use crucible_core::attestation::Provenance;
 use crucible_core::PubKey;
 
+/// Below this, self-reported *distinct* `lineage`/`env` no longer buys full
+/// independence credit when a policy requires attestation and this
+/// contributor's provenance wasn't backed by one.
+///
+/// Fabricating two distinct strings is free; attesting them is not. Without a
+/// floor, an unattested pair reporting deliberately different values reads as
+/// fully independent regardless of whether they are — the same shape of gap
+/// `require_verified_blind` closes for `blind`, applied to `lineage`/`env`.
+/// The value sits below the herding term (0.50) and well below lineage (0.80):
+/// enough to meaningfully discount a claimed-independent pair, not so much
+/// that two genuinely different, merely-unattested agents read as clones.
+pub const UNATTESTED_FLOOR: f64 = 0.30;
+
 /// One piece of evidence entering the pool.
 #[derive(Clone, Debug)]
 pub struct Contributor<'a> {
@@ -37,6 +50,12 @@ pub struct Contributor<'a> {
     pub weight: f64,
     /// `+1` supports, `-1` refutes, `0` abstains.
     pub sign: f64,
+    /// Whether this contributor's `lineage`/`env` are backed by a trusted
+    /// authority's signature rather than only self-reported. Defaults to
+    /// `true` when a community has not opted into requiring attestation —
+    /// callers that don't care set this and never think about it again; see
+    /// [`UNATTESTED_FLOOR`].
+    pub attested: bool,
 }
 
 /// What survived the discount, in the same order as the input.
@@ -55,9 +74,16 @@ fn correlation(a: &Contributor, b: &Contributor) -> f64 {
     if a.key == b.key {
         // Self-agreement is not evidence. Without this, the cheapest attack on
         // the substrate is a `for` loop.
-        1.0
+        return 1.0;
+    }
+    let raw = a.provenance.similarity(b.provenance);
+    if a.attested && b.attested {
+        raw
     } else {
-        a.provenance.similarity(b.provenance)
+        // At least one side's claimed distinctness is unattested: do not fully
+        // trust it. This only ever *raises* correlation, never lowers it below
+        // what the honest similarity computation already found.
+        raw.max(UNATTESTED_FLOOR)
     }
 }
 
@@ -170,6 +196,7 @@ mod tests {
             provenance: p,
             weight,
             sign,
+            attested: true,
         }
     }
 
@@ -239,6 +266,7 @@ mod tests {
                     provenance: Box::leak(Box::new(env)),
                     weight: 1.0,
                     sign: 1.0,
+                    attested: true,
                 }
             })
             .collect();

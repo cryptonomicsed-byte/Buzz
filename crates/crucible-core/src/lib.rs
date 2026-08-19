@@ -22,6 +22,7 @@ pub mod error;
 pub mod event;
 pub mod ids;
 pub mod kinds;
+pub mod provenance_attestation;
 pub mod verdict;
 
 pub use attestation::{Attestation, Outcome};
@@ -31,6 +32,7 @@ pub use commitment::{commitment_hash, Commitment};
 pub use error::{Error, Result};
 pub use event::{NostrEvent, Tag};
 pub use ids::{EventId, PubKey, Signature};
+pub use provenance_attestation::ProvenanceAttestation;
 pub use verdict::{Status, Verdict};
 
 /// Unix seconds. Crucible never reads the clock itself; callers pass time in so

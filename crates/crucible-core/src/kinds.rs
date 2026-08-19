@@ -38,8 +38,12 @@ pub const FALSIFIER_MANIFEST: u32 = 47007;
 /// later claim of `blind: true` is checkable rather than merely asserted.
 pub const COMMITMENT: u32 = 47008;
 
+/// A trusted authority vouching for an agent's declared `lineage`/`env`, so a
+/// community can require attestation rather than trust self-report.
+pub const PROVENANCE_ATTESTATION: u32 = 47009;
+
 /// Every kind Crucible defines, in ascending order.
-pub const ALL: [u32; 8] = [
+pub const ALL: [u32; 9] = [
     CLAIM,
     ATTESTATION,
     CHALLENGE,
@@ -48,6 +52,7 @@ pub const ALL: [u32; 8] = [
     BELIEF_SNAPSHOT,
     FALSIFIER_MANIFEST,
     COMMITMENT,
+    PROVENANCE_ATTESTATION,
 ];
 
 /// The half-open range Crucible reserves. Anything outside it is not ours, and
@@ -70,6 +75,7 @@ pub const fn name(kind: u32) -> Option<&'static str> {
         BELIEF_SNAPSHOT => "belief-snapshot",
         FALSIFIER_MANIFEST => "falsifier-manifest",
         COMMITMENT => "commitment",
+        PROVENANCE_ATTESTATION => "provenance-attestation",
         _ => return None,
     })
 }

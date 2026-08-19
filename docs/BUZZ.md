@@ -114,7 +114,9 @@ Two things. First, the community's
   "max_attestations": 512,    // resolution is quadratic in this
   "max_half_life": 7776000,   // 90 days; longer half-lives never go stale
   "roster": ["<npub-hex>"],   // REQUIRED unless allow_unrostered is set
-  "require_verified_blind": false  // demand commit-reveal proof of blind:true
+  "require_verified_blind": false,  // demand commit-reveal proof of blind:true
+  "require_attested_provenance": false,  // demand a vouch for lineage/env
+  "provenance_authorities": ["<npub-hex>"]  // who is trusted to vouch
 }
 ```
 
@@ -147,6 +149,19 @@ passing `blind_nonce` to `probe.run`); an unbacked claim is downgraded to
 `blind: false` for the correlation math rather than trusted at face value.
 Lower severity than the roster gap — it overstates independence rather than
 manufacturing witnesses outright — so it defaults the permissive way.
+
+Fourth, also optional: `require_attested_provenance` plus
+`provenance_authorities`. Off by default, so `lineage`/`env` are trusted the
+way they always were, a self-report. Turn it on and name the keys your
+community trusts to vouch (an admission service, a CI identity provider) and
+an attestation's `lineage`/`env` only count as verified when a `kind:47009`
+attestation from one of those keys backs them exactly (`crucible
+provenance.attest`). Unbacked provenance is not excluded — it is floored to
+`independence::UNATTESTED_FLOOR` correlation, so twenty containers of one
+model with twenty invented lineages can no longer read as twenty independent
+witnesses just because nobody vouched for any of them. Same shape as
+`require_verified_blind`: a soft upgrade a community opts into, not a new
+requirement imposed on everyone.
 
 ## Reading a verdict in a channel
 

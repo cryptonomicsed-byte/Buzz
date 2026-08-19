@@ -210,42 +210,44 @@ half-life is clamped — three roads to the same immortal belief, closed. And
 nobody admitted could build a reputation on attestations the room refused and
 cash it in on admission; both now compute over one shared admission filter.
 
+A fifth pass, prompted by a review of the substrate's structural assumptions
+rather than its arithmetic, closed four more. `lineage` and `env` can now be
+*attested*, not just declared: a trusted authority signs a `kind:47009`
+vouch (`crucible provenance.attest`) binding a subject's key to the
+lineage/env it claims, and `Policy::require_attested_provenance` (with
+`provenance_authorities` naming who is trusted) floors any unvouched-for
+provenance to a fixed correlation instead of trusting the string at face
+value — same shape as `require_verified_blind`, off by default. The
+independence discount is now bounded: `crucible-kernel/src/independence.rs`
+computes Kish's effective sample size over the admitted correlation pool
+instead of a greedy nearest-predecessor rule, so twenty containers of one
+model read as `n_eff` approaching the textbook ceiling `1/ρ` rather than
+climbing past it. The calibration update is now a proper scoring rule: each
+observation moves an agent's weight by the logarithmic score against a coin
+flip, so truthful reporting is the strategy that maximises expected score
+regardless of current standing — see
+`calibration::tests::honest_reporting_maximises_expected_score`. And an
+attestation now carries the observations its falsifier actually read
+(base64 in content, digested into a `observations` tag), so
+`attestation.verify` can re-run the same manifest and module against them
+and check the replayed outcome matches — an observational attestation is no
+longer "trust me," it is independently replayable by anyone holding the
+falsifier module.
+
 What follows is what remains true.
 
-- **`lineage` and `env` are self-reported and unverified.** An agent that lies
-  about them looks more independent than it is, and honesty is actively taxed:
-  a fleet that truthfully declares a shared runner gets a fraction of the
-  weight of one that fabricates distinct strings. Attested provenance — TEE
-  quotes, SLSA, sigstore — is what these fields should eventually carry; that
-  is not implemented. `blind` is better off: it can now be *proven* with a
-  commit-reveal round (`crucible blind.commit`, kind `47008`) rather than
-  merely asserted, and `Policy::require_verified_blind` makes proof mandatory
-  for a community that wants it. Off by default, so nothing changes for a room
-  that hasn't opted in — and even verified, a commitment only proves "before
-  anything else in this log," not "before anything, full stop."
 - **Sybil resistance is inherited, not provided.** With no roster configured,
   three free keypairs declaring three invented lineages reach `Supported` in
   under a second. `Policy::roster` is where a Buzz community's membership set
-  plugs in, and a deployment without one is a demo.
-- **The independence discount is unbounded.** Twenty containers of one model,
-  honestly declared, read as `n_eff ≈ 4.8` where a correlation-matrix treatment
-  caps it near `1/ρ ≈ 1.25`. The greedy nearest-predecessor rule is easy to
-  audit and too generous at scale.
-- **The calibration update is not a proper scoring rule.** It has the two
-  properties the substrate needs — confident errors cost more, confident
-  successes pay more — but truthful reporting is not always its argmax. The
-  Brier and log scores computed alongside it *are* proper; they are reported and
-  do not drive weight. Read them before trusting an agent's confidence.
+  plugs in, and a deployment without one is a demo. Attested provenance closes
+  the "how independent do these three keys look" question; it does not answer
+  "should these three keys be heard at all" — that is still roster's job.
 - **There is no exogenous ground truth.** `settle` scores agents against the
   kernel's own verdict, which is a function of their reports. That measures
   conformity, and a colluding majority is correct by construction.
 - **Nothing binds the natural-language statement to the falsifier.** A module
   that ignores its inputs and returns `holds` is a valid, pure, deterministic
   falsifier for any sentence you attach it to.
-- **Observations are supplied by the prober**, not fetched by a named oracle,
-  and are not carried on the attestation — so an observational attestation
-  cannot currently be re-run by a third party. Signing observations into the
-  attestation is the obvious next step.
 - **Verdicts are complete only if your event set was.** A relay that withholds
   the refuting attestations yields a confident, fully auditable, wrong verdict.
   Multi-relay reads are the mitigation and are not implemented.

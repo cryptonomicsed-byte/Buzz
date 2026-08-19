@@ -92,6 +92,24 @@ pub struct Policy {
     /// unchanged.
     pub require_verified_blind: bool,
 
+    /// Require a trusted authority's vouch before honouring self-reported
+    /// `lineage`/`env` as genuinely distinct.
+    ///
+    /// Off by default, same reasoning as `require_verified_blind`: fabricating
+    /// two distinct strings is free, but a Sybil still needs a distinct,
+    /// admitted key first, so this overstates independence rather than
+    /// manufacturing it. When on, provenance not backed by a matching, unexpired
+    /// [`crate::calibration`]-adjacent vouch (`kind:47009`, signed by a key in
+    /// `provenance_authorities`) is floored at
+    /// [`crate::independence::UNATTESTED_FLOOR`] correlation rather than trusted
+    /// at whatever the self-report claims.
+    pub require_attested_provenance: bool,
+
+    /// Keys trusted to vouch for `lineage`/`env` when
+    /// `require_attested_provenance` is set. `None` trusts nobody, which — with
+    /// the flag on — floors every attestor's provenance; set both together.
+    pub provenance_authorities: Option<BTreeSet<PubKey>>,
+
     /// Calibration domains this community recognises.
     ///
     /// The domain is chosen by the claim's *author*, and reliability is keyed on
@@ -125,6 +143,8 @@ impl Default for Policy {
             max_half_life: 90 * 86_400,
             allow_unrostered: false,
             require_verified_blind: false,
+            require_attested_provenance: false,
+            provenance_authorities: None,
             domains: None,
         }
     }
@@ -152,6 +172,13 @@ impl Policy {
     /// Whether `domain` is one this community recognises.
     pub fn recognises(&self, domain: &str) -> bool {
         self.domains.as_ref().is_none_or(|d| d.contains(domain))
+    }
+
+    /// Whether `authority` is trusted to vouch for provenance.
+    pub fn is_provenance_authority(&self, authority: &PubKey) -> bool {
+        self.provenance_authorities
+            .as_ref()
+            .is_some_and(|a| a.contains(authority))
     }
 
     /// Reject a policy that cannot mean anything, so a bad config fails at load

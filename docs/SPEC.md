@@ -108,12 +108,25 @@ Somebody ran the falsifier and signed what happened.
 | `experiment` | Must equal the claim's experiment id |
 | `outcome` | `holds` \| `fails` \| `indeterminate` |
 | `digest` | SHA-256 of the falsifier's verdict and explanation |
+| `observations` | SHA-256 of the falsifier's gathered observations (see below) |
 | `fuel` | Fuel consumed |
 | `lineage` | Model/implementation lineage |
 | `env` | Execution environment fingerprint |
 | `blind` | `true` if run **before** reading any prior attestation or verdict |
+| `nonce` | Present only on a commit-reveal (see 47008 below) |
 
-Content is the falsifier's explanation.
+Content is base64(JSON) of `{"explanation": ..., "observations": {<name>: base64(bytes), ...}}` —
+the same observation bytes the sandboxed falsifier actually read, not just its
+verdict on them. `observations` tag commits to their digest so a reader can
+detect a content/tag mismatch without re-running anything, and `probe.run`
+verb populates both together so it is not possible to sign one against the
+other. `attestation.verify` (the `crucible-cli` verb) re-runs the same
+manifest and module against the embedded observations and checks that the
+replayed outcome and digest match what was attested — an observational
+attestation ceases to be "trust me" and becomes independently checkable by
+any third party holding the falsifier module, because the inputs that
+produced the verdict travel with the verdict instead of staying on the
+attestor's machine.
 
 Anything dated more than `max_clock_skew` seconds ahead of the resolver's `now`
 is refused — attestations *and* claims alike. Age drives decay and `created_at`
@@ -129,9 +142,12 @@ reading that as refutation would let anyone refute anything by shipping a
 module that divides by zero.
 
 `lineage`, `env` and `blind` are **self-reported and unverified by default**.
-`blind` can be *upgraded* to verified with a commit-reveal round — see below.
-`lineage` and `env` remain the substrate's soft underbelly, and the README
-says so plainly.
+`blind` can be *upgraded* to verified with a commit-reveal round — see 47008
+below. `lineage` and `env` can be upgraded to verified by a trusted third
+party's vouch — see 47009 below. Neither upgrade is automatic: a community
+that has not opted into `require_verified_blind` or
+`require_attested_provenance` sees self-report trusted exactly as before, and
+the README says so plainly.
 
 ---
 
@@ -170,6 +186,46 @@ revealed. What it cannot prove: that the committer didn't peek at something
 outside this log entirely — no cryptographic commitment can. "Verified blind"
 means "provably committed before seeing any other attestation or verdict in
 *this* log," which is the property the independence model actually needs.
+
+---
+
+## 47009 — provenance attestation
+
+A trusted third party vouching that a subject's declared `lineage`/`env` are
+real, closing the gap self-report leaves open: an attestor can already write
+any string into `lineage` and `env`, and correlated agents with fabricated
+distinct-looking provenance read as independent to the discount in
+`crucible-kernel/src/independence.rs`. Signed by the **authority**, never by
+the subject — self-vouching is what an attestation already provides for
+free.
+
+| Tag | Value |
+| --- | --- |
+| `subject` | Pubkey this vouch is about |
+| `lineage` | Must equal the value asserted in the attestation/claim it backs |
+| `env` | Must equal the value asserted in the attestation/claim it backs |
+| `expiry` | Unix timestamp after which the vouch no longer counts |
+
+A vouch is checked field-for-field: it only backs an attestation whose
+`lineage` and `env` match exactly, and only up to `expiry`. This is enforced
+only when `Policy::require_attested_provenance` (see
+[docs/BUZZ.md](BUZZ.md#what-an-operator-has-to-decide)) is set and
+`Policy::provenance_authorities` names who is trusted to vouch; by default,
+`lineage`/`env` are trusted exactly as self-reported, so a community that has
+not opted in sees no behaviour change. Under the strict policy, provenance
+that is not backed by a vouch from a listed authority is floored to
+`independence::UNATTESTED_FLOOR` correlation rather than trusted at face
+value — a floor, not an exclusion, because an unvouched attestor may still be
+telling the truth; it just cannot buy the *low*-correlation credit that a
+verified-distinct lineage earns.
+
+What this proves: an authority the community already trusts is willing to put
+its own signature behind this subject's declared lineage and environment.
+What it cannot prove: that the authority itself did real diligence — this
+substrate has no opinion on how an authority decides who to vouch for, the
+same way it has no opinion on how a Buzz operator decides who to admit to a
+roster. The trust it requires is exactly the trust a community already
+extends to whoever runs its admission service or CI identity provider.
 
 ---
 

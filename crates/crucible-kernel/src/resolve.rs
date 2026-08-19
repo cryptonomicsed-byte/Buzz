@@ -11,7 +11,8 @@ use crate::independence::{discount, Contributor};
 use crate::policy::Policy;
 use crucible_core::attestation::Provenance;
 use crucible_core::{
-    Attestation, Challenge, Claim, Commitment, EventId, Outcome, PubKey, Status, Timestamp, Verdict,
+    Attestation, Challenge, Claim, Commitment, EventId, Outcome, ProvenanceAttestation, PubKey,
+    Status, Timestamp, Verdict,
 };
 use serde::{Deserialize, Serialize};
 
@@ -204,15 +205,40 @@ fn is_verified_blind(
     })
 }
 
+/// Whether `subject`'s declared `lineage`/`env` is backed by a trusted
+/// authority, as of `now`.
+///
+/// Returns `true` unconditionally when the policy does not require it — the
+/// same "no opinion unless asked" default as [`is_verified_blind`]'s caller,
+/// so a community that hasn't configured `provenance_authorities` sees no
+/// behaviour change.
+fn is_provenance_attested(
+    subject: &PubKey,
+    lineage: &str,
+    env: &str,
+    policy: &Policy,
+    provenance_attestations: &[ProvenanceAttestation],
+    now: Timestamp,
+) -> bool {
+    if !policy.require_attested_provenance {
+        return true;
+    }
+    provenance_attestations.iter().any(|pa| {
+        policy.is_provenance_authority(&pa.authority) && pa.vouches_for(subject, lineage, env, now)
+    })
+}
+
 /// Resolve a claim against everything known about it.
 ///
 /// `now` is supplied rather than read so that replaying history reproduces the
 /// verdicts history actually saw.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve(
     claim: &Claim,
     attestations: &[Attestation],
     challenges: &[Challenge],
     commitments: &[Commitment],
+    provenance_attestations: &[ProvenanceAttestation],
     ledger: &Ledger,
     policy: &Policy,
     now: Timestamp,
@@ -294,7 +320,17 @@ pub fn resolve(
         decay: f64,
         sign: f64,
         provenance: Provenance,
+        attested: bool,
     }
+
+    let author_attested = is_provenance_attested(
+        &claim.author,
+        &claim.provenance.lineage,
+        &claim.provenance.env,
+        policy,
+        provenance_attestations,
+        now,
+    );
 
     let mut rows = vec![Row {
         source: claim.id,
@@ -313,6 +349,7 @@ pub fn resolve(
         // yet exist, so "the author had nothing to read" is true by
         // construction rather than a claim that needs verifying.
         provenance: claim.provenance.clone(),
+        attested: author_attested,
     }];
 
     for a in &deduped {
@@ -331,6 +368,14 @@ pub fn resolve(
                 provenance.blind = false;
             }
         }
+        let attested = is_provenance_attested(
+            &a.attestor,
+            &provenance.lineage,
+            &provenance.env,
+            policy,
+            provenance_attestations,
+            now,
+        );
         rows.push(Row {
             source: a.id,
             author: a.attestor,
@@ -340,6 +385,7 @@ pub fn resolve(
             decay: decay_at(a.created_at),
             sign: a.outcome.sign(),
             provenance,
+            attested,
         });
     }
 
@@ -350,6 +396,7 @@ pub fn resolve(
             provenance: &r.provenance,
             weight: r.raw * r.decay,
             sign: r.sign,
+            attested: r.attested,
         })
         .collect();
 
