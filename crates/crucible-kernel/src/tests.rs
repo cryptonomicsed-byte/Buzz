@@ -124,6 +124,11 @@ impl ProbeSpec {
                 env: self.env.into(),
                 blind: self.blind,
             },
+            // No commit-reveal ceremony by default: these are plain
+            // self-reported-blind fixtures, same as before this field existed.
+            // Tests that specifically exercise verified blindness build their
+            // own commitment/attestation pairs.
+            blind_nonce: None,
         }
     }
 }
@@ -150,7 +155,7 @@ fn resolve_at(
     ledger: &Ledger,
     now: u64,
 ) -> crate::resolve::Resolution {
-    resolve(claim, probes, &[], ledger, &open_policy(), now)
+    resolve(claim, probes, &[], &[], ledger, &open_policy(), now)
 }
 
 // ---------------------------------------------------------------- independence
@@ -758,6 +763,7 @@ fn a_stricter_policy_demands_more_witnesses() {
         &claim,
         &probes,
         &[],
+        &[],
         &Ledger::new(),
         &Policy {
             allow_unrostered: true,
@@ -937,6 +943,7 @@ fn a_challenge_does_not_move_belief_by_itself() {
         &claim,
         &probes,
         &challenges,
+        &[],
         &Ledger::new(),
         &open_policy(),
         T0,
@@ -1039,7 +1046,7 @@ fn attestors_outside_the_roster_are_excluded_with_a_reason() {
         roster: Some([key(200), key(1), key(2)].into_iter().collect()),
         ..open_policy()
     };
-    let closed = resolve(&claim, &sybils, &[], &Ledger::new(), &policy, T0);
+    let closed = resolve(&claim, &sybils, &[], &[], &Ledger::new(), &policy, T0);
     assert_eq!(closed.verdict.attestations, 2);
     assert_eq!(closed.excluded.len(), 3);
     assert!(closed.excluded[0].reason.contains("roster"));
@@ -1058,7 +1065,7 @@ fn an_unadmitted_author_carries_no_weight_of_its_own() {
         roster: Some([key(1)].into_iter().collect()),
         ..open_policy()
     };
-    let r = resolve(&claim, &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &[], &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.mass, 0.5);
     assert_eq!(r.verdict.support, 0.0);
 }
@@ -1081,7 +1088,7 @@ fn a_domain_the_community_does_not_recognise_earns_the_author_nothing() {
         ),
         ..open_policy()
     };
-    let r = resolve(&claim, &[], &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &[], &[], &[], &ledger, &policy, T0);
     assert_eq!(r.verdict.support, 0.0);
 }
 
@@ -1104,7 +1111,7 @@ fn attestations_beyond_the_cap_are_dropped_oldest_first() {
         max_attestations: 10,
         ..open_policy()
     };
-    let r = resolve(&claim, &flood, &[], &Ledger::new(), &policy, T0 + 500);
+    let r = resolve(&claim, &flood, &[], &[], &Ledger::new(), &policy, T0 + 500);
     assert!(r.verdict.attestations <= 10);
     assert!(r.excluded.iter().any(|e| e.reason.contains("cap")));
 }
@@ -1232,7 +1239,7 @@ fn an_absurd_half_life_is_clamped_and_reported() {
 
     let policy = open_policy();
     let far = T0 + policy.max_half_life * 60;
-    let r = resolve(&forever, &probes, &[], &ledger, &policy, far);
+    let r = resolve(&forever, &probes, &[], &[], &ledger, &policy, far);
 
     assert_eq!(r.verdict.status, Status::Decayed);
     assert!(
@@ -1268,7 +1275,7 @@ fn settlement_scores_only_what_the_verdict_counted() {
         ..Policy::default()
     };
     let mut ledger = Ledger::new();
-    let r = resolve(&claim, &probes, &[], &ledger, &policy, T0 + 60);
+    let r = resolve(&claim, &probes, &[], &[], &ledger, &policy, T0 + 60);
     assert_eq!(r.verdict.status, Status::Supported);
     assert_eq!(r.verdict.attestations, 4);
     assert_eq!(r.excluded.len(), 2);
@@ -1331,7 +1338,7 @@ fn an_unadmitted_challenger_is_not_scored() {
     };
 
     let mut ledger = Ledger::new();
-    let r = resolve(&claim, &probes, &[], &ledger, &policy, T0);
+    let r = resolve(&claim, &probes, &[], &[], &ledger, &policy, T0);
     settle(
         &mut ledger,
         &claim,
@@ -1341,4 +1348,181 @@ fn an_unadmitted_challenger_is_not_scored() {
         &policy,
     );
     assert_eq!(ledger.get(&key(90), "ci").evidence(), 0.0);
+}
+
+// -------------------------------------------------------------- commit-reveal
+
+/// Build a valid commitment/attestation pair: the committer commits to an
+/// outcome and output digest under a nonce, then reveals both in the
+/// attestation. `commit_at` and `reveal_at` let a test control the timing that
+/// determines whether the commitment actually proves blindness.
+fn blind_pair(
+    n: u8,
+    outcome: Outcome,
+    claim: &Claim,
+    commit_at: u64,
+    reveal_at: u64,
+) -> (crucible_core::Commitment, Attestation) {
+    let attestor = key(n);
+    let experiment = claim.falsifier.experiment_id();
+    let output_digest = [match outcome {
+        Outcome::Holds => 1,
+        Outcome::Fails => 2,
+        Outcome::Indeterminate => 3,
+    }; 32];
+    let nonce = [n; 32];
+    let hash = crucible_core::commitment_hash(
+        &attestor,
+        &claim.id,
+        &experiment,
+        outcome,
+        &output_digest,
+        &nonce,
+    );
+    let commitment = crucible_core::Commitment {
+        id: id(100 + n),
+        committer: attestor,
+        created_at: commit_at,
+        claim: claim.id,
+        experiment,
+        hash,
+    };
+    let mut att = ProbeSpec::independent(n, outcome).build(claim);
+    att.created_at = reveal_at;
+    att.output_digest = output_digest;
+    att.provenance.blind = true;
+    att.blind_nonce = Some(nonce);
+    (commitment, att)
+}
+
+fn rostered_verified_blind_policy() -> Policy {
+    Policy {
+        allow_unrostered: true,
+        require_verified_blind: true,
+        ..Policy::default()
+    }
+}
+
+/// The mechanism this whole section exists for: two attestors who genuinely
+/// committed before either could have seen the other's answer keep full
+/// `blind` credit under a policy that demands proof of it.
+#[test]
+fn a_valid_early_commitment_preserves_blind_credit() {
+    let claim = a_claim();
+    let (c1, a1) = blind_pair(1, Outcome::Holds, &claim, T0, T0 + 10);
+    let (c2, a2) = blind_pair(2, Outcome::Holds, &claim, T0 + 1, T0 + 11);
+
+    let policy = rostered_verified_blind_policy();
+    // Resolve right at the later reveal, not later still, so the assertion
+    // below isolates the correlation math from ordinary time decay.
+    let r = resolve(
+        &claim,
+        &[a1, a2],
+        &[],
+        &[c1, c2],
+        &Ledger::new(),
+        &policy,
+        T0 + 11,
+    );
+    // Two genuinely blind, distinct-provenance witnesses: full credit, same as
+    // the unverified default would have given them.
+    // A one-second decay gap between the two reveals accounts for the last
+    // fraction of a percent; the point of this assertion is that correlation
+    // did not discount them, not that decay was zero.
+    assert!(
+        (r.verdict.n_eff - 2.0).abs() < 0.01,
+        "verified-blind witnesses must keep full credit, got n_eff={}",
+        r.verdict.n_eff
+    );
+}
+
+/// Without a policy requiring proof, self-reported `blind: true` is still
+/// trusted exactly as before this mechanism existed — the default must not
+/// silently change behaviour for every community that hasn't opted in.
+#[test]
+fn unverified_blind_is_unaffected_when_the_policy_does_not_require_proof() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+    let r = resolve_at(&claim, &probes, &Ledger::new(), T0);
+    assert!((r.verdict.n_eff - 2.0).abs() < 1e-9);
+}
+
+/// The point of the whole mechanism: an attestor who *claims* blind but never
+/// committed to anything gets downgraded, once a community actually asks for
+/// proof. Two such claims from otherwise-independent provenances now read as
+/// partially correlated (the herding term), not fully independent.
+#[test]
+fn an_unbacked_claim_of_blindness_is_downgraded_when_verification_is_required() {
+    let claim = a_claim();
+    let probes: Vec<_> = (1..=2)
+        .map(|n| ProbeSpec::independent(n, Outcome::Holds).build(&claim))
+        .collect();
+
+    let policy = rostered_verified_blind_policy();
+    let r = resolve(&claim, &probes, &[], &[], &Ledger::new(), &policy, T0);
+    assert!(
+        r.verdict.n_eff < 2.0,
+        "unbacked blind claims must lose credit once proof is required, got {}",
+        r.verdict.n_eff
+    );
+}
+
+/// A commitment that arrives *after* another attestor's answer was already on
+/// the record proves nothing — the committer could have read it first. Its
+/// blindness claim must be downgraded exactly as if it had never committed.
+#[test]
+fn a_late_commitment_does_not_prove_blindness() {
+    let claim = a_claim();
+    // Attestor 1 answers first, honestly, with no commitment at all.
+    let a1 = ProbeSpec::independent(1, Outcome::Holds).build(&claim);
+    // Attestor 2 commits and reveals *after* attestor 1's answer already
+    // exists — too late to prove it did not read it.
+    let (c2, a2) = blind_pair(2, Outcome::Holds, &claim, T0 + 100, T0 + 110);
+
+    let policy = rostered_verified_blind_policy();
+    let r = resolve(
+        &claim,
+        &[a1, a2],
+        &[],
+        &[c2],
+        &Ledger::new(),
+        &policy,
+        T0 + 200,
+    );
+    // Attestor 2's claimed blindness is not honoured, so the pair correlates
+    // through the herding term instead of counting as two full witnesses.
+    assert!(
+        r.verdict.n_eff < 2.0,
+        "a late commitment must not prove blindness, got n_eff={}",
+        r.verdict.n_eff
+    );
+}
+
+/// A commitment that opens to a *different* outcome than what was actually
+/// revealed does not count — the committer could have committed to one answer
+/// and then, having seen the room, revealed something else.
+#[test]
+fn a_commitment_that_does_not_match_the_reveal_does_not_count() {
+    let claim = a_claim();
+    let (c1, mut a1) = blind_pair(1, Outcome::Holds, &claim, T0, T0 + 10);
+    // Swap what's actually revealed after committing to Holds.
+    a1.outcome = Outcome::Fails;
+    a1.output_digest = [2; 32];
+    let (c2, a2) = blind_pair(2, Outcome::Holds, &claim, T0 + 1, T0 + 11);
+
+    let policy = rostered_verified_blind_policy();
+    let r = resolve(
+        &claim,
+        &[a1, a2],
+        &[],
+        &[c1, c2],
+        &Ledger::new(),
+        &policy,
+        T0 + 60,
+    );
+    // Attestor 1's mismatched reveal is downgraded; only attestor 2's blindness
+    // is honoured, so this cannot read as two fully independent witnesses.
+    assert!(r.verdict.n_eff < 2.0);
 }

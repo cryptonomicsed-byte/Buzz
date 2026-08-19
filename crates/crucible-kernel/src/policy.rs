@@ -79,6 +79,19 @@ pub struct Policy {
     /// a second. Running without one has to be a thing somebody chose.
     pub allow_unrostered: bool,
 
+    /// Require a valid commit-reveal before honouring an attestor's claim of
+    /// `blind: true`.
+    ///
+    /// Off by default, for the same reason `allow_unrostered` defaults the
+    /// other way: this closes a real gap (self-reported blindness is free to
+    /// claim and only ever raises how independent an attestor looks) but is a
+    /// strictly *lower* severity one than an open roster — it overstates
+    /// independence rather than manufacturing it outright, since the attestor
+    /// still has to be a distinct, admitted key. A community that wants the
+    /// guarantee turns this on; one that doesn't gets today's behaviour,
+    /// unchanged.
+    pub require_verified_blind: bool,
+
     /// Calibration domains this community recognises.
     ///
     /// The domain is chosen by the claim's *author*, and reliability is keyed on
@@ -111,6 +124,7 @@ impl Default for Policy {
             max_attestations: 512,
             max_half_life: 90 * 86_400,
             allow_unrostered: false,
+            require_verified_blind: false,
             domains: None,
         }
     }

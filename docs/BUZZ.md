@@ -113,7 +113,8 @@ Two things. First, the community's
   "max_clock_skew": 300,      // how far ahead a claim or probe may be dated
   "max_attestations": 512,    // resolution is quadratic in this
   "max_half_life": 7776000,   // 90 days; longer half-lives never go stale
-  "roster": ["<npub-hex>"]    // REQUIRED unless allow_unrostered is set
+  "roster": ["<npub-hex>"],   // REQUIRED unless allow_unrostered is set
+  "require_verified_blind": false  // demand commit-reveal proof of blind:true
 }
 ```
 
@@ -136,6 +137,16 @@ adversary controls. Fill it from your community's membership set:
 Without it, `resolve` and `ledger.replay` **refuse to run**. If you genuinely
 want an open room, say so with `"allow_unrostered": true` — the point is that it
 be a thing somebody chose, not a default nobody noticed.
+
+Third, if it matters to your community: `require_verified_blind`. Off by
+default, so nothing changes for a room that hasn't heard of it — `blind: true`
+is trusted the way it always was, a self-report. Turn it on and an attestor
+must back that claim with a `kind:47008` commitment published before it could
+have read anyone else's answer (`crucible blind.commit`, then reveal by
+passing `blind_nonce` to `probe.run`); an unbacked claim is downgraded to
+`blind: false` for the correlation math rather than trusted at face value.
+Lower severity than the roster gap — it overstates independence rather than
+manufacturing witnesses outright — so it defaults the permissive way.
 
 ## Reading a verdict in a channel
 

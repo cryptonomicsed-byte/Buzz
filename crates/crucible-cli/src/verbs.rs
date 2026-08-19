@@ -10,7 +10,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crucible_core::attestation::{observations_digest, AttestationContent, Provenance};
 use crucible_core::claim::{ClaimBody, FalsifierRef};
 use crucible_core::{
-    kinds, Attestation, Challenge, Claim, EventId, NostrEvent, PubKey, Signature, Timestamp,
+    kinds, Attestation, Challenge, Claim, Commitment, EventId, NostrEvent, PubKey, Signature,
+    Timestamp,
 };
 use crucible_kernel::{resolve, settle, Ledger, Policy};
 use crucible_probe::{Falsifier, Manifest, Observations};
@@ -342,6 +343,15 @@ pub fn probe_run(input: &Value) -> Result<Value> {
                     .and_then(Value::as_bool)
                     .ok_or_else(|| anyhow!("blind must be stated explicitly, true or false"))?,
             },
+            blind_nonce: match input.get("blind_nonce").and_then(Value::as_str) {
+                Some(h) => Some(
+                    <[u8; 32]>::try_from(
+                        hex::decode(h).context("blind_nonce is not hex")?.as_slice(),
+                    )
+                    .map_err(|_| anyhow!("blind_nonce must be 32 bytes"))?,
+                ),
+                None => None,
+            },
         };
         // Observations travel *in the signed content*, not just as a digest in
         // a tag. Without them, "somebody ran the falsifier" is unfalsifiable by
@@ -426,6 +436,67 @@ pub fn attestation_verify(input: &Value) -> Result<Value> {
     }))
 }
 
+/// Build an unsigned commitment (`kind:47008`) — the "commit" half of proving
+/// `blind: true` rather than merely asserting it.
+///
+/// Publish this *before* reading anyone else's attestation or a verdict on the
+/// claim, then reveal by including `nonce` in the `probe.run` call that builds
+/// the actual attestation. `nonce` is the caller's to generate and keep secret
+/// until reveal — Crucible does not supply randomness for the same reason
+/// `event.sign` does not supply a signing key: concealment before reveal is
+/// the whole point, and a value this tool could produce is a value this tool
+/// could also leak.
+pub fn blind_commit(input: &Value) -> Result<Value> {
+    let committer = pubkey(input, "pubkey")?;
+    let created_at = field(input, "created_at")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("created_at must be a unix timestamp"))?;
+    let claim =
+        EventId::parse_hex(str_field(input, "claim")?).map_err(|e| anyhow!("claim: {e}"))?;
+    let experiment = hex::decode(str_field(input, "experiment")?)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or_else(|| anyhow!("experiment must be a 32-byte hex digest"))?;
+    let outcome = crucible_core::Outcome::parse(str_field(input, "outcome")?)
+        .ok_or_else(|| anyhow!("outcome must be holds, fails or indeterminate"))?;
+    let output_digest = hex::decode(str_field(input, "output_digest")?)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or_else(|| anyhow!("output_digest must be a 32-byte hex digest"))?;
+    let nonce = hex::decode(str_field(input, "nonce")?)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or_else(|| {
+            anyhow!("nonce must be a 32-byte hex value you generated and are keeping secret")
+        })?;
+
+    let commitment = crucible_core::Commitment {
+        id: EventId::from_bytes([0; 32]),
+        committer,
+        created_at,
+        claim,
+        experiment,
+        hash: crucible_core::commitment_hash(
+            &committer,
+            &claim,
+            &experiment,
+            outcome,
+            &output_digest,
+            &nonce,
+        ),
+    };
+
+    Ok(json!({
+        "event": unsigned(
+            &committer,
+            kinds::COMMITMENT,
+            created_at,
+            commitment.to_unsigned_tags(),
+            String::new(),
+        ),
+    }))
+}
+
 /// Announce a falsifier so others can look it up by digest (`kind:47007`).
 ///
 /// Without this, a prober handed a claim knows the module's hash but has no way
@@ -479,6 +550,7 @@ struct Gathered {
     claim: Claim,
     attestations: Vec<Attestation>,
     challenges: Vec<Challenge>,
+    commitments: Vec<Commitment>,
     rejected: Vec<Value>,
 }
 
@@ -517,6 +589,7 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
 
     let mut attestations = Vec::new();
     let mut challenges = Vec::new();
+    let mut commitments = Vec::new();
     for ev in &valid {
         match ev.kind {
             kinds::ATTESTATION => match Attestation::from_event(ev) {
@@ -529,6 +602,11 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
                 Ok(_) => {}
                 Err(e) => rejected.push(json!({"id": ev.id.to_hex(), "reason": e.to_string()})),
             },
+            kinds::COMMITMENT => match Commitment::from_event(ev) {
+                Ok(c) if c.claim == claim.id => commitments.push(c),
+                Ok(_) => {}
+                Err(e) => rejected.push(json!({"id": ev.id.to_hex(), "reason": e.to_string()})),
+            },
             _ => {}
         }
     }
@@ -537,6 +615,7 @@ fn gather(events: &[NostrEvent], claim_id: Option<EventId>, verify: bool) -> Res
         claim,
         attestations,
         challenges,
+        commitments,
         rejected,
     })
 }
@@ -608,6 +687,7 @@ pub fn resolve_verb(input: &Value) -> Result<Value> {
         &g.claim,
         &g.attestations,
         &g.challenges,
+        &g.commitments,
         &ledger,
         &policy,
         now,
@@ -681,6 +761,7 @@ pub fn ledger_replay(input: &Value) -> Result<Value> {
             &g.claim,
             &g.attestations,
             &g.challenges,
+            &g.commitments,
             &ledger,
             &policy,
             now,
@@ -883,8 +964,14 @@ pub fn tools() -> Value {
                     "manifest": "manifest", "module_path|module_hex": "wasm", "module_digest": "hex?",
                     "inputs": "json", "observations": "{key: string}",
                     "claim": "hex?", "experiment": "hex?", "pubkey": "hex?", "created_at": "unix?",
-                    "lineage": "string?", "env": "string?", "blind": "bool?"
+                    "lineage": "string?", "env": "string?", "blind": "bool?",
+                    "blind_nonce": "hex? — the nonce from a prior blind.commit, to reveal it"
                 },
+            },
+            {
+                "name": "blind.commit",
+                "summary": "Build a commitment to an outcome you have already computed but not yet revealed, so a later blind:true in probe.run's attestation is provable rather than merely asserted. Publish this before reading anyone else's attestation or verdict on the claim.",
+                "input": {"pubkey": "hex", "created_at": "unix", "claim": "hex", "experiment": "hex", "outcome": "holds|fails|indeterminate", "output_digest": "hex", "nonce": "hex, 32 bytes you generated and kept secret"},
             },
             {
                 "name": "attestation.verify",
@@ -934,6 +1021,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
         "claim.build" => claim_build(input),
         "probe.run" => probe_run(input),
         "attestation.verify" => attestation_verify(input),
+        "blind.commit" => blind_commit(input),
         "resolve" => resolve_verb(input),
         "ledger.replay" => ledger_replay(input),
         "event.verify" => event_verify(input),
@@ -1679,5 +1767,147 @@ mod hardening {
             "manifest": manifest(), "module_hex": hex::encode(b"nope"),
         }))
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod blind_commit_reveal {
+    use super::tests::*;
+    use super::*;
+
+    /// The full round trip through the tool surface an agent actually calls:
+    /// commit before running the reveal, reveal with the nonce, resolve under
+    /// a policy that demands proof, and confirm both attestors keep full
+    /// independence credit.
+    #[test]
+    fn a_committed_and_revealed_pair_verifies_end_to_end() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let claim_id = claim["id"].as_str().unwrap();
+
+        let run = |_seed: &str| {
+            probe_run(&json!({
+                "manifest": manifest(), "module_path": CI_GREEN, "module_digest": digest,
+                "inputs": {"sha": "deadbeef"}, "observations": {"ci:status": "green"},
+            }))
+            .unwrap()
+        };
+        let dry1 = run("prober1");
+        let dry2 = run("prober2");
+
+        let (sk1, pk1) = keys("prober1");
+        let (sk2, pk2) = keys("prober2");
+        let nonce1 = "11".repeat(32);
+        let nonce2 = "22".repeat(32);
+
+        let commit1 = sign(
+            &blind_commit(&json!({
+                "pubkey": pk1, "created_at": at, "claim": claim_id, "experiment": experiment,
+                "outcome": dry1["outcome"], "output_digest": dry1["output_digest"], "nonce": nonce1,
+            }))
+            .unwrap()["event"],
+            &sk1,
+        );
+        let commit2 = sign(
+            &blind_commit(&json!({
+                "pubkey": pk2, "created_at": at + 1, "claim": claim_id, "experiment": experiment,
+                "outcome": dry2["outcome"], "output_digest": dry2["output_digest"], "nonce": nonce2,
+            }))
+            .unwrap()["event"],
+            &sk2,
+        );
+
+        let reveal = |pk: &str, sk: &str, nonce: &str, at: u64| {
+            let out = probe_run(&json!({
+                "manifest": manifest(), "module_path": CI_GREEN, "module_digest": digest,
+                "inputs": {"sha": "deadbeef"}, "observations": {"ci:status": "green"},
+                "claim": claim_id, "experiment": experiment,
+                "pubkey": pk, "created_at": at,
+                "lineage": pk, "env": format!("host-{pk}"), "blind": true,
+                "blind_nonce": nonce,
+            }))
+            .unwrap();
+            sign(&out["attestation"], sk)
+        };
+        let att1 = reveal(&pk1, &sk1, &nonce1, at + 10);
+        let att2 = reveal(&pk2, &sk2, &nonce2, at + 11);
+
+        let out = resolve_verb(&json!({
+            "events": [claim.clone(), commit1, commit2, att1, att2],
+            "now": at + 11,
+            "policy": {"allow_unrostered": true, "require_verified_blind": true},
+        }))
+        .unwrap();
+
+        let n_eff = out["resolution"]["verdict"]["n_eff"].as_f64().unwrap();
+        assert!(
+            (n_eff - 2.0).abs() < 0.01,
+            "a genuinely committed-and-revealed pair must keep full credit, got {n_eff}"
+        );
+        assert!(out["resolution"]["excluded"].as_array().unwrap().is_empty());
+    }
+
+    /// An attestation claiming `blind: true` with no commitment at all must be
+    /// downgraded once a policy actually requires proof — this is the fix, not
+    /// a side effect of it.
+    #[test]
+    fn a_reveal_with_no_commitment_is_downgraded_under_strict_policy() {
+        let at = 1_700_000_000;
+        let (claim, experiment, digest) = a_claim(at);
+        let a1 = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "goose",
+            "green",
+            "goose-model",
+            at,
+        );
+        let a2 = a_probe(
+            &claim,
+            &experiment,
+            &digest,
+            "codex",
+            "green",
+            "codex-model",
+            at,
+        );
+
+        let permissive = resolve_verb(&json!({
+            "events": [claim.clone(), a1.clone(), a2.clone()],
+            "now": at,
+            "policy": {"allow_unrostered": true},
+        }))
+        .unwrap();
+        let strict = resolve_verb(&json!({
+            "events": [claim, a1, a2],
+            "now": at,
+            "policy": {"allow_unrostered": true, "require_verified_blind": true},
+        }))
+        .unwrap();
+
+        let permissive_n = permissive["resolution"]["verdict"]["n_eff"]
+            .as_f64()
+            .unwrap();
+        let strict_n = strict["resolution"]["verdict"]["n_eff"].as_f64().unwrap();
+        assert!(
+            strict_n < permissive_n,
+            "unbacked blind claims must lose credit under the strict policy: \
+             permissive={permissive_n}, strict={strict_n}"
+        );
+    }
+
+    #[test]
+    fn blind_commit_refuses_a_malformed_nonce() {
+        let (_, pk) = keys("author");
+        let err = blind_commit(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000,
+            "claim": "11".repeat(32), "experiment": "22".repeat(32),
+            "outcome": "holds", "output_digest": "33".repeat(32),
+            "nonce": "not-hex",
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nonce"), "got {err}");
     }
 }

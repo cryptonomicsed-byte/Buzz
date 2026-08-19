@@ -212,13 +212,17 @@ cash it in on admission; both now compute over one shared admission filter.
 
 What follows is what remains true.
 
-- **`lineage`, `env` and `blind` are self-reported and unverified.** An agent
-  that lies about them looks more independent than it is, and honesty is
-  actively taxed: a fleet that truthfully declares a shared runner gets a
-  fraction of the weight of one that fabricates distinct strings. Attested
-  provenance — TEE quotes, SLSA, sigstore — is what these fields should
-  eventually carry. `blind` in particular is unfalsifiable as specified; a
-  commit-then-reveal round would fix it. Neither is implemented.
+- **`lineage` and `env` are self-reported and unverified.** An agent that lies
+  about them looks more independent than it is, and honesty is actively taxed:
+  a fleet that truthfully declares a shared runner gets a fraction of the
+  weight of one that fabricates distinct strings. Attested provenance — TEE
+  quotes, SLSA, sigstore — is what these fields should eventually carry; that
+  is not implemented. `blind` is better off: it can now be *proven* with a
+  commit-reveal round (`crucible blind.commit`, kind `47008`) rather than
+  merely asserted, and `Policy::require_verified_blind` makes proof mandatory
+  for a community that wants it. Off by default, so nothing changes for a room
+  that hasn't opted in — and even verified, a commitment only proves "before
+  anything else in this log," not "before anything, full stop."
 - **Sybil resistance is inherited, not provided.** With no roster configured,
   three free keypairs declaring three invented lineages reach `Supported` in
   under a second. `Policy::roster` is where a Buzz community's membership set

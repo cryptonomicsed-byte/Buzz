@@ -22,6 +22,7 @@ other's events.
 | 47005 | `calibration` | A scoring-rule update to an agent's reliability |
 | 47006 | `belief-snapshot` | Digest of current belief, for fast bootstrap |
 | 47007 | `falsifier-manifest` | Announcement of a reusable falsifier |
+| 47008 | `commitment` | A commit-reveal commitment proving `blind: true` |
 
 Emit a `47007` with `crucible falsifier.announce`. It carries the module digest
 as both `d` and `module` (so it is addressable by digest), the manifest digest,
@@ -127,8 +128,48 @@ starved or was denied an observation has said something about *itself*, and
 reading that as refutation would let anyone refute anything by shipping a
 module that divides by zero.
 
-`lineage`, `env` and `blind` are **self-reported and unverified**. They are the
-substrate's soft underbelly, and the README says so plainly.
+`lineage`, `env` and `blind` are **self-reported and unverified by default**.
+`blind` can be *upgraded* to verified with a commit-reveal round — see below.
+`lineage` and `env` remain the substrate's soft underbelly, and the README
+says so plainly.
+
+---
+
+## 47008 — commitment
+
+Proves `blind: true` instead of merely asserting it. Publish this **before**
+reading any other attestation or verdict on the claim; reveal by including
+`nonce` in the attestation that follows.
+
+| Tag | Value |
+| --- | --- |
+| `e` | `[<claim-id>, "", "claim"]` |
+| `experiment` | The experiment this commitment concerns |
+| `hash` | `SHA256("crucible/blind-commitment/v1\0" ‖ committer ‖ claim ‖ experiment ‖ outcome ‖ output_digest ‖ nonce)` |
+
+The attestation that reveals it carries the matching `nonce` tag (32-byte hex).
+A resolver checks three things before honouring the claimed blindness: the
+reveal actually opens the commitment (same committer, outcome and output
+digest, correct nonce); the commitment's timestamp is no later than the
+attestation's own; and — the check that gives "blind" its meaning — no later
+than the *earliest* other admitted attestation on the claim, so the committer
+could not have read anyone else's answer first.
+
+This is enforced only when `Policy::require_verified_blind` (see
+[docs/BUZZ.md](BUZZ.md#what-an-operator-has-to-decide)) is set;
+by default, `blind: true` is trusted exactly as before, so a community that
+has not opted in sees no behaviour change. Binding the outcome and digest into
+the hash — not just "I will attest" — is what makes a commitment mean
+anything: a committer who could swap their answer after seeing the room has
+revealed nothing by committing first. The nonce keeps the hash from being
+guessable outright, since `outcome` has only three values and `output_digest`
+is often predictable for a given claim.
+
+What this proves: the commitment came first and matches what was later
+revealed. What it cannot prove: that the committer didn't peek at something
+outside this log entirely — no cryptographic commitment can. "Verified blind"
+means "provably committed before seeing any other attestation or verdict in
+*this* log," which is the property the independence model actually needs.
 
 ---
 

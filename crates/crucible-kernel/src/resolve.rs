@@ -11,7 +11,7 @@ use crate::independence::{discount, Contributor};
 use crate::policy::Policy;
 use crucible_core::attestation::Provenance;
 use crucible_core::{
-    Attestation, Challenge, Claim, EventId, Outcome, PubKey, Status, Timestamp, Verdict,
+    Attestation, Challenge, Claim, Commitment, EventId, Outcome, PubKey, Status, Timestamp, Verdict,
 };
 use serde::{Deserialize, Serialize};
 
@@ -177,6 +177,33 @@ fn claim_in_effect(claim: &Claim, policy: &Policy, now: Timestamp) -> bool {
     claim.created_at <= now.saturating_add(policy.max_clock_skew)
 }
 
+/// Whether `a`'s claim of `blind: true` is backed by a commitment that proves
+/// it, rather than merely asserting it.
+///
+/// A commitment counts only if it: opens with exactly the outcome and output
+/// digest this attestation actually reports (so it cannot have been swapped in
+/// after the fact); was published no later than this attestation's own
+/// timestamp (a commitment cannot postdate its reveal); and — the check that
+/// gives "blind" its meaning — was published no later than the *earliest*
+/// other admitted attestation on this claim, so the committer could not have
+/// seen anyone else's answer before locking in their own.
+fn is_verified_blind(
+    a: &Attestation,
+    commitments: &[Commitment],
+    earliest_other: Option<Timestamp>,
+) -> bool {
+    let Some(nonce) = a.blind_nonce else {
+        return false;
+    };
+    commitments.iter().any(|c| {
+        c.claim == a.claim
+            && c.experiment == a.experiment
+            && c.opens_with(&a.attestor, a.outcome, &a.output_digest, &nonce)
+            && c.created_at <= a.created_at
+            && earliest_other.is_none_or(|t| c.created_at <= t)
+    })
+}
+
 /// Resolve a claim against everything known about it.
 ///
 /// `now` is supplied rather than read so that replaying history reproduces the
@@ -185,6 +212,7 @@ pub fn resolve(
     claim: &Claim,
     attestations: &[Attestation],
     challenges: &[Challenge],
+    commitments: &[Commitment],
     ledger: &Ledger,
     policy: &Policy,
     now: Timestamp,
@@ -257,7 +285,7 @@ pub fn resolve(
     };
     let author_decay = decay_at(claim.created_at);
 
-    struct Row<'a> {
+    struct Row {
         source: EventId,
         author: PubKey,
         role: Role,
@@ -265,7 +293,7 @@ pub fn resolve(
         raw: f64,
         decay: f64,
         sign: f64,
-        provenance: &'a Provenance,
+        provenance: Provenance,
     }
 
     let mut rows = vec![Row {
@@ -280,10 +308,29 @@ pub fn resolve(
         raw: author_weight,
         decay: author_decay,
         sign: if odds >= 0.0 { 1.0 } else { -1.0 },
-        provenance: &claim.provenance,
+        // Not subject to the same commit-reveal requirement as an attestor's
+        // `blind`: at the moment a claim is authored, no attestation on it can
+        // yet exist, so "the author had nothing to read" is true by
+        // construction rather than a claim that needs verifying.
+        provenance: claim.provenance.clone(),
     }];
 
     for a in &deduped {
+        let mut provenance = a.provenance.clone();
+        if policy.require_verified_blind && provenance.blind {
+            let earliest_other = deduped
+                .iter()
+                .filter(|o| o.attestor != a.attestor)
+                .map(|o| o.created_at)
+                .min();
+            if !is_verified_blind(a, commitments, earliest_other) {
+                // Self-reported and unbacked by a commitment: this policy does
+                // not extend the benefit of the doubt. Downgrading to `false`
+                // is the conservative reading — the same one an untagged
+                // observational falsifier gets elsewhere in this module.
+                provenance.blind = false;
+            }
+        }
         rows.push(Row {
             source: a.id,
             author: a.attestor,
@@ -292,7 +339,7 @@ pub fn resolve(
             raw: ledger.weight(&a.attestor, &claim.domain),
             decay: decay_at(a.created_at),
             sign: a.outcome.sign(),
-            provenance: &a.provenance,
+            provenance,
         });
     }
 
@@ -300,7 +347,7 @@ pub fn resolve(
         .iter()
         .map(|r| Contributor {
             key: r.author,
-            provenance: r.provenance,
+            provenance: &r.provenance,
             weight: r.raw * r.decay,
             sign: r.sign,
         })

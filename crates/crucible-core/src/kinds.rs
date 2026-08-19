@@ -33,8 +33,13 @@ pub const BELIEF_SNAPSHOT: u32 = 47006;
 /// manifest, so falsifiers are themselves discoverable and reusable.
 pub const FALSIFIER_MANIFEST: u32 = 47007;
 
+/// A commitment to an attestation's outcome, published *before* the attestor
+/// could have seen any other attestation or verdict on the claim, so that a
+/// later claim of `blind: true` is checkable rather than merely asserted.
+pub const COMMITMENT: u32 = 47008;
+
 /// Every kind Crucible defines, in ascending order.
-pub const ALL: [u32; 7] = [
+pub const ALL: [u32; 8] = [
     CLAIM,
     ATTESTATION,
     CHALLENGE,
@@ -42,6 +47,7 @@ pub const ALL: [u32; 7] = [
     CALIBRATION,
     BELIEF_SNAPSHOT,
     FALSIFIER_MANIFEST,
+    COMMITMENT,
 ];
 
 /// The half-open range Crucible reserves. Anything outside it is not ours, and
@@ -63,6 +69,7 @@ pub const fn name(kind: u32) -> Option<&'static str> {
         CALIBRATION => "calibration",
         BELIEF_SNAPSHOT => "belief-snapshot",
         FALSIFIER_MANIFEST => "falsifier-manifest",
+        COMMITMENT => "commitment",
         _ => return None,
     })
 }

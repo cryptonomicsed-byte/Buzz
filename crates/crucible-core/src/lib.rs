@@ -17,6 +17,7 @@
 pub mod attestation;
 pub mod challenge;
 pub mod claim;
+pub mod commitment;
 pub mod error;
 pub mod event;
 pub mod ids;
@@ -26,6 +27,7 @@ pub mod verdict;
 pub use attestation::{Attestation, Outcome};
 pub use challenge::Challenge;
 pub use claim::{Claim, FalsifierRef};
+pub use commitment::{commitment_hash, Commitment};
 pub use error::{Error, Result};
 pub use event::{NostrEvent, Tag};
 pub use ids::{EventId, PubKey, Signature};

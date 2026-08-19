@@ -156,6 +156,12 @@ pub struct Attestation {
     /// on identical inputs would be a cheap second non-determinism signal.
     pub fuel: u64,
     pub provenance: Provenance,
+    /// The nonce that opens a prior [`crate::Commitment`], if this attestor
+    /// wants `provenance.blind` to be *verified* rather than merely asserted.
+    /// Absent entirely (not `None` because it was denied — just never
+    /// offered) means the kernel treats `blind` the old way: self-reported,
+    /// unverified, and worth trusting accordingly.
+    pub blind_nonce: Option<[u8; 32]>,
 }
 
 fn parse_digest(s: &str) -> Option<[u8; 32]> {
@@ -235,11 +241,19 @@ impl Attestation {
                 env: ev.require_tag("env")?.to_string(),
                 blind,
             },
+            blind_nonce: match ev.tag("nonce") {
+                None => None,
+                Some(raw) => Some(parse_digest(raw).ok_or_else(|| Error::BadTag {
+                    tag: "nonce",
+                    value: raw.to_string(),
+                    reason: "not a 32-byte hex value",
+                })?),
+            },
         })
     }
 
     pub fn to_unsigned_tags(&self) -> Vec<Vec<String>> {
-        vec![
+        let mut tags = vec![
             vec![
                 "e".into(),
                 self.claim.to_hex(),
@@ -254,7 +268,11 @@ impl Attestation {
             vec!["lineage".into(), self.provenance.lineage.clone()],
             vec!["env".into(), self.provenance.env.clone()],
             vec!["blind".into(), self.provenance.blind.to_string()],
-        ]
+        ];
+        if let Some(nonce) = self.blind_nonce {
+            tags.push(vec!["nonce".into(), hex::encode(nonce)]);
+        }
+        tags
     }
 
     /// Parse this attestation's `content` as [`AttestationContent`] and check
