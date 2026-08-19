@@ -9,9 +9,19 @@
 //! unanimous confidence in a false belief — and unlike a human meeting, it does
 //! it in four seconds and writes it to the audit log.
 //!
-//! The discount here is deliberately simple enough to audit by hand. Walk the
-//! evidence in the order the room learned it; each piece contributes only the
-//! fraction of itself that everything already on the record does not explain.
+//! The discount is a running [effective sample size](https://en.wikipedia.org/wiki/Design_effect)
+//! under correlation, in the sense a statistician means it: for `n`
+//! equal-weight, equicorrelated witnesses at correlation `ρ`, the classic
+//! result is `n_eff = n / (1 + (n-1)ρ)`, which climbs toward `1/ρ` and never
+//! past it. Twenty clones at `ρ=0.8` are worth `1.25` witnesses in the limit,
+//! not twenty, and not the linearly-growing number an earlier version of this
+//! module produced by discounting each newcomer only against its single
+//! closest predecessor.
+//!
+//! Evidence is still walked in the order the room learned it, and each item's
+//! credit is still fixed the moment it is processed — nothing arriving later
+//! can revise it. That is what makes an append-only replay safe: a verdict a
+//! room already trusts cannot be demoted by evidence added after the fact.
 
 use crucible_core::attestation::Provenance;
 use crucible_core::PubKey;
@@ -54,41 +64,76 @@ fn correlation(a: &Contributor, b: &Contributor) -> f64 {
 /// Discount a pool of evidence for redundancy.
 ///
 /// Contributors are consumed **in the order given**, which must be the order the
-/// room learned them: the claim first, then attestations by timestamp. Each one
-/// is scaled by `1 - max correlation with anything already on the record`, so a
-/// genuinely independent probe counts in full while the tenth clone of the first
-/// adds almost nothing.
+/// room learned them: the claim first, then attestations by timestamp.
 ///
-/// Chronological order rather than strongest-first is a deliberate choice, and
-/// the reason is monotonicity. If the pool were re-sorted by strength, a strong
-/// late arrival could be admitted ahead of two earlier witnesses and explain
-/// them both away, *lowering* the independent count — which would hand an
-/// adversary a way to demote a settled claim by adding evidence to it. Ordering
-/// by arrival makes the record append-only: nothing already counted can be
-/// devalued by what comes later, and "novelty" reads as what it says — how much
-/// this adds to what the room already had.
+/// For each new contributor `c` joining an already-admitted set `S`, this
+/// computes the *marginal* effective sample size it adds:
 ///
-/// Using the maximum correlation rather than, say, a sum keeps the result
-/// bounded and interpretable: a contributor is discounted by its single closest
-/// predecessor, the one that most plausibly explains it away.
+/// ```text
+/// kish(S) = |S|² / Σ_{i,j∈S} ρ(i,j)          (ρ(i,i) = 1)
+/// novelty(c) = max(0, kish(S ∪ {c}) − kish(S))
+/// ```
+///
+/// `kish` is the standard weighted design-effect formula (all correlation
+/// weights here are 1, since novelty is meant to measure "how much of a
+/// distinct witness is this" independent of how reliable that witness is —
+/// reliability is folded in afterward, in `effective`). Two properties fall
+/// out of the definition and both are load-bearing:
+///
+/// * **Bounded.** For a cluster of `n` witnesses pairwise correlated at `ρ`,
+///   `kish` evaluates to exactly `n/(1+(n-1)ρ)`, which is the textbook
+///   effective-sample-size result and converges to `1/ρ` as the cluster grows
+///   — it does not grow without limit the way discounting each newcomer only
+///   against its nearest predecessor does.
+/// * **Monotonic.** `kish` can, in principle, *fall* when a new item is highly
+///   correlated with a *mix* of earlier, less-correlated items (the global
+///   recomputation dilutes their combined signal). Flooring the marginal at
+///   zero is what turns that into "this item added nothing" rather than "the
+///   room now believes less than it did a moment ago" — a verdict already
+///   reached must never be worth less because more evidence arrived.
+///
+/// Only evidence can explain evidence away: an abstention (`sign == 0`)
+/// contributes nothing to belief, so it is excluded from `S` entirely and
+/// cannot make anyone else look redundant. Publishing a free, unscored
+/// indeterminate probe wearing an honest fleet's declared provenance must not
+/// collapse that fleet's independent count.
 pub fn discount(contributors: &[Contributor<'_>]) -> Vec<Discounted> {
-    let mut out = Vec::with_capacity(contributors.len());
+    let mut out = vec![
+        Discounted {
+            novelty: 0.0,
+            effective: 0.0
+        };
+        contributors.len()
+    ];
+
+    // `pair_sum` is Σ_{i,j∈S} ρ(i,j) over the admitted pool `S` built so far;
+    // `kish_prev` is kish(S) after the previous admission, so each step's
+    // marginal is a single subtraction rather than a full recomputation.
+    let mut admitted: Vec<usize> = Vec::with_capacity(contributors.len());
+    let mut pair_sum = 0.0f64;
+    let mut kish_prev = 0.0f64;
+
     for (i, c) in contributors.iter().enumerate() {
-        let redundancy = contributors[..i]
+        if c.sign == 0.0 {
+            continue; // stays at the default: novelty 0, effective 0
+        }
+        let cross: f64 = admitted
             .iter()
-            // Only evidence can explain evidence away. An abstention contributes
-            // nothing to belief, so letting it absorb a later attestor's novelty
-            // would be a free suppression primitive: publish one indeterminate
-            // probe wearing the provenance of an honest fleet, and the whole
-            // fleet's independent count collapses.
-            .filter(|earlier| earlier.sign != 0.0)
-            .map(|earlier| correlation(c, earlier))
-            .fold(0.0f64, f64::max);
-        let novelty = (1.0 - redundancy).clamp(0.0, 1.0);
-        out.push(Discounted {
+            .map(|&j| correlation(c, &contributors[j]))
+            .sum();
+        // Adding one member to S changes Σρ by twice its cross terms (ρ is
+        // symmetric) plus its own self-correlation of 1.
+        pair_sum += 2.0 * cross + 1.0;
+        let k = (admitted.len() + 1) as f64;
+        let kish = k * k / pair_sum;
+        let novelty = (kish - kish_prev).max(0.0);
+        kish_prev = kish;
+
+        out[i] = Discounted {
             novelty,
             effective: c.weight * novelty * c.sign,
-        });
+        };
+        admitted.push(i);
     }
     out
 }
@@ -171,10 +216,41 @@ mod tests {
         let d = discount(&pool);
         let n_eff = effective_count(&pool, &d);
         assert!(
-            n_eff < 2.5,
+            n_eff < 1.2,
             "ten same-model, same-runner, non-blind agents must not look like ten, got {n_eff}"
         );
         assert!(n_eff > 1.0, "they are not literally one agent either");
+    }
+
+    /// The exact scenario an adversarial review measured against the previous
+    /// (unbounded) algorithm: twenty containers of one model, twenty distinct
+    /// environments, run blind of each other. `lineage` matches (ρ contribution
+    /// 0.80) but `env` differs and nobody is herding, so `ρ = 0.80` and the
+    /// textbook effective-sample-size ceiling is `1/ρ = 1.25`. The old
+    /// algorithm read this as `n_eff ≈ 4.8` — seventeen times the honest count —
+    /// and called it `Supported` at mass 0.97.
+    #[test]
+    fn twenty_containers_of_one_model_are_bounded_near_the_textbook_ceiling() {
+        let pool: Vec<_> = (1..=20)
+            .map(|i| {
+                let env = prov("claude-opus-5", &format!("container-{i}"), true);
+                Contributor {
+                    key: PubKey::from_bytes([i; 32]),
+                    provenance: Box::leak(Box::new(env)),
+                    weight: 1.0,
+                    sign: 1.0,
+                }
+            })
+            .collect();
+        let n_eff = effective_count(&pool, &discount(&pool));
+        assert!(
+            (n_eff - 1.235).abs() < 0.01,
+            "expected the design-effect value for n=20, ρ=0.8 (≈1.235), got {n_eff}"
+        );
+        assert!(
+            n_eff < 1.25 + 1e-9,
+            "must never exceed the 1/ρ ceiling, got {n_eff}"
+        );
     }
 
     /// The append-only property. Whatever arrives later, what the room already
@@ -233,6 +309,31 @@ mod tests {
             effective_count(&pool, &d),
             1.0,
             "an indeterminate probe is not an independent opinion"
+        );
+    }
+
+    /// The floor at zero that makes bounding safe: a global recomputation of
+    /// `kish` can otherwise fall when a new item is correlated with a mix of
+    /// earlier witnesses, and letting that show up as negative marginal would
+    /// mean a verdict gets *worse* evidence behind it purely because more
+    /// evidence arrived.
+    #[test]
+    fn a_marginal_that_would_be_negative_is_floored_not_subtracted() {
+        let a = prov("claude", "linux", true);
+        let b = prov("goose", "darwin", true);
+        let independent = [contrib(1, &a, 1.0, 1.0), contrib(2, &b, 1.0, 1.0)];
+        let before = effective_count(&independent, &discount(&independent));
+        assert_eq!(before, 2.0);
+
+        // A third witness correlated with both — a raw (unfloored) Kish
+        // recomputation here would put the three-item total *below* 2.0.
+        let clone_of_a = prov("claude", "linux", true);
+        let mut three = independent.to_vec();
+        three.push(contrib(3, &clone_of_a, 1.0, 1.0));
+        let after = effective_count(&three, &discount(&three));
+        assert!(
+            after >= before - 1e-9,
+            "adding evidence must never lower the total: {before} -> {after}"
         );
     }
 
