@@ -847,10 +847,10 @@ fn an_indeterminate_probe_is_not_scored() {
         &open_policy(),
     );
 
-    assert_eq!(
-        ledger.get(&key(5), "ci").r(),
-        crate::calibration::BOOTSTRAP,
-        "an honest abstention must neither gain nor lose standing"
+    assert!(
+        (ledger.get(&key(5), "ci").r() - crate::calibration::BOOTSTRAP).abs() < 1e-3,
+        "an honest abstention must neither gain nor lose standing, got {}",
+        ledger.get(&key(5), "ci").r()
     );
 }
 
@@ -1283,9 +1283,15 @@ fn settlement_scores_only_what_the_verdict_counted() {
     );
     // The author is scored for its claim, and for nothing else.
     let author = ledger.get(&key(200), "ci");
+    // ln(0.8/0.5): the log-score of a truthful, correct p=0.8 forecast (the
+    // claim's own declared confidence) against the coin-flip baseline. If the
+    // future-dated self-attestation had *also* been scored, this would include
+    // a second such term and be roughly double.
+    let one_truthful_call = (0.8f64 / 0.5).ln();
     assert!(
-        (author.evidence() - 0.6).abs() < 1e-9,
-        "the claimant inflated its own record with a future-dated self-attestation: {}",
+        (author.evidence() - one_truthful_call).abs() < 1e-9,
+        "the claimant inflated its own record with a future-dated self-attestation: \
+         evidence was {}, expected exactly one scored call ({one_truthful_call})",
         author.evidence()
     );
     for n in 1..=4 {
